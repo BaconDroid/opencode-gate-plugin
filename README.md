@@ -180,6 +180,19 @@ Hook callbacks run in plugin registration order, which follows the order of the
 sees, which is the behaviour described above. The plugin works either way; the
 ordering only decides who gets the last word on the delay.
 
+## What the gate does not do
+
+- It **queues** a saturated request; it does not route it to the next model in
+  the agent's chain. See
+  [issue #1](https://github.com/BaconDroid/opencode-gate-plugin/issues/1).
+- It does not skip a provider whose allowance is exhausted. It distinguishes a
+  throttle from an exhausted quota for its retry decision, but an exhausted
+  provider still takes a slot. See
+  [issue #5](https://github.com/BaconDroid/opencode-gate-plugin/issues/5).
+
+The full picture, including what was measured and why the routing feature
+cannot live in the HTTP hook, is in [docs/PLAN.md](docs/PLAN.md).
+
 ## Reading the log
 
 ```
