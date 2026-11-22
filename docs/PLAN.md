@@ -65,14 +65,27 @@ The gate changes this in two ways:
    `{retry: true, delay}` and takes the maximum of the host's delay and its
    own, so the provider's `Retry-After` is never shortened.
 
-### What it does not do
+### Does it route to the next model in the chain?
 
-**It does not route to the next model in the chain when the current provider is
-saturated.** The gate queues instead. With a budget of 2 and a 9-second agent
-turn, a request can wait minutes.
+**Yes, with `routing` enabled.** A request whose provider is saturated goes to
+the next model in the agent's chain instead of waiting for a slot, and the next
+request goes back to the head of the chain once the provider frees up.
 
-That is the gap, and it is tracked in
-[#1](https://github.com/BaconDroid/opencode-gate-plugin/issues/1).
+The chain is walked from the head on every prompt, so the routing is elastic
+rather than a one-way descent. A provider that was skipped because it was busy
+is picked again as soon as it is free.
+
+Measured live on 2026-11-22:
+
+```
+route ses_rf_e: routing aireiter/mimo-v2.6-flash -> opencode-go/mimo-v2.6-flash
+response opencode-go status=429
+exhausted opencode-go: allowance exhausted, skipping it until it resets in 367h
+response commandcode status=400
+exhausted commandcode: allowance exhausted, skipping it until it for 30min
+```
+
+Implemented in [#1](https://github.com/BaconDroid/opencode-gate-plugin/issues/1).
 
 ## Why the routing feature cannot live in the HTTP hook
 
@@ -112,32 +125,29 @@ each time was `insufficient credits`.
 
 Tracked in [#5](https://github.com/BaconDroid/opencode-gate-plugin/issues/5).
 
-The distinction is already available. OpenCode classifies the provider failure
-before it builds the session error:
+**This is implemented.** A provider whose allowance is exhausted is left out
+of the rotation until its quota resets, and the reset time is read from the
+provider's own message. The exhausted state is shared through a file under
+`lockDir`, so another OpenCode instance on the same key does not walk into an
+empty subscription.
 
-- `provider.rate-limit` for a throttle
-- `provider.quota` for an exhausted allowance
-
-The gate uses that for the retry decision today; it should use it for admission
-too.
+See [#5](https://github.com/BaconDroid/opencode-gate-plugin/issues/5).
 
 ## Work
 
 Ordered by value. Each item is an issue with acceptance criteria.
 
-1. **[#1] Route to the next model in the chain when the current provider is
-   saturated.** The headline feature. Intercepts before model resolution, uses
-   `switchModel`, and needs a hand-off rule so oh-my-opencode-slim's fallback
-   does not immediately switch back.
-2. **[#5] Detect an exhausted provider and skip it.** Distinguish
-   `provider.quota` from `provider.rate-limit` at admission time, fail fast
-   instead of queueing, and honour the reset time the provider reports.
-3. **[#2] Document that subagents share the budget**, and make the composition
-   of the load visible in the log.
+1. ~~**[#1] Route to the next model in the chain when the current provider is
+   saturated.**~~ **Done.** The decision is made in the `prompt` hook, which
+   is the last point where the session's model can still be changed.
+2. ~~**[#5] Detect an exhausted provider and skip it.**~~ **Done.** The reset
+   time is read from the provider's message and the state is shared on disk.
+3. ~~**[#2] Document that subagents share the budget.**~~ **Done.**
 4. **[#3] Name the slot holder.** The log says a request waited, not who held
    the slot. The session id is in the hook event already.
 5. **[#4] A status command.** One command that answers "is the gate healthy,
-   and who holds the slots", instead of reading log files by hand.
+   and who holds the slots", instead of reading log files by hand. It should
+   also report the exhausted providers, since that state is now on disk.
 6. **[#6] Honour `Retry-After` on release.** Currently unobservable: the live
    runs produced zero 429s, so the immediate release is already correct in
    practice. It is worth confirming rather than assuming.
