@@ -1,0 +1,23 @@
+{
+  "name": "opencode-gate-plugin",
+  "version": "0.2.0",
+  "description": "Client-side concurrency gate for OpenCode providers that cap in-flight requests per API key or account",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "rate-limit",
+    "concurrency",
+    "aireiter",
+    "oh-my-opencode-slim"
+  ],
+  "license": "MIT"
+}
