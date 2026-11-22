@@ -180,18 +180,64 @@ Hook callbacks run in plugin registration order, which follows the order of the
 sees, which is the behaviour described above. The plugin works either way; the
 ordering only decides who gets the last word on the delay.
 
-## What the gate does not do
+## Elastic routing
 
-- It **queues** a saturated request; it does not route it to the next model in
-  the agent's chain. See
-  [issue #1](https://github.com/BaconDroid/opencode-gate-plugin/issues/1).
-- It does not skip a provider whose allowance is exhausted. It distinguishes a
-  throttle from an exhausted quota for its retry decision, but an exhausted
-  provider still takes a slot. See
-  [issue #5](https://github.com/BaconDroid/opencode-gate-plugin/issues/5).
+With `routing` enabled, a request whose provider is saturated goes to the next
+model in the agent's chain instead of waiting for a slot. When the provider
+frees up, the next request goes back to the head of the chain.
 
-The full picture, including what was measured and why the routing feature
-cannot live in the HTTP hook, is in [docs/PLAN.md](docs/PLAN.md).
+```json
+{
+  "providers": {
+    "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
+    "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
+    "opencode-go":        { "concurrency": 4 },
+    "commandcode":        { "concurrency": 4 }
+  },
+  "routing": {
+    "enabled": true,
+    "configPath": "/root/.config/opencode/oh-my-opencode-slim.json"
+  }
+}
+```
+
+The chains come from oh-my-opencode-slim's configuration, so the two plugins
+have to agree on where that file lives.
+
+### What it does
+
+- **Walks the chain from the head, every time.** A provider that was skipped
+  because it was busy is picked again as soon as it is free. The routing is
+  elastic, not a one-way descent.
+- **Skips a provider whose allowance is exhausted.** A saturated provider
+  answers again once it has a slot; an exhausted one cannot answer at all
+  until its quota resets, so it is left out of the rotation until then. The
+  reset time is read from the provider's own message when it gives one.
+- **Shares what it learned.** The exhausted state is written to a file under
+  `lockDir`, so another OpenCode instance on the same key does not walk into a
+  subscription that is already known to be empty.
+
+### The decision is made before the model is resolved
+
+The routing decision happens in the `prompt` hook, which fires when a prompt
+is submitted. That is the only point where the session's model can still be
+changed: `ctx.session.switchModel` writes the session record, and the model a
+turn uses is read from that record when the turn starts. By the time the
+`http.request` hook fires, the request body has already been built for the
+model that was chosen.
+
+A session that has not run yet carries no agent, and the runner picks the
+default agent for it. The plugin makes the same choice, so the chain it
+consults is the one the runner will use.
+
+### What it does not do
+
+- It does not change the model of a request that is already in flight.
+- It does not reorder the chain, and it does not change which models are in
+  it. That is oh-my-opencode-slim's configuration to decide.
+
+The full picture, including what was measured, is in
+[docs/PLAN.md](docs/PLAN.md).
 
 ## Reading the log
 

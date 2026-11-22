@@ -36,9 +36,11 @@
  *     resolves.
  */
 
-import { mkdirSync, rmSync, readdirSync, statSync, writeFileSync, appendFileSync } from "node:fs"
+import { mkdirSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync, appendFileSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
+
+import * as Routing from "./src/routing.js"
 
 const DEFAULTS = {
   /**
@@ -95,6 +97,24 @@ const DEFAULTS = {
    * concurrency. The provider's `Retry-After` wins when it asks for longer.
    */
   concurrencyRetryDelayMs: 2000,
+  /**
+   * Route a request to the next model in the agent's chain when the provider
+   * of the current model is saturated, instead of waiting for a slot. When the
+   * provider frees up, the next request goes back to the head of the chain.
+   *
+   * The chain comes from oh-my-opencode-slim's configuration, so
+   * `configPath` points at that file and `preset` names the preset to read.
+   */
+  routing: {
+    enabled: false,
+    /**
+     * How long a provider stays skipped after an exhausted allowance, when the
+     * provider does not say when it resets.
+     */
+    exhaustedTtlMs: 30 * 60 * 1000,
+    configPath: join(homedir(), ".config/opencode/oh-my-opencode-slim.json"),
+    preset: undefined,
+  },
 }
 
 function resolveOptions(raw) {
@@ -111,6 +131,11 @@ function resolveOptions(raw) {
     options.concurrencyRetryDelayMs = DEFAULTS.concurrencyRetryDelayMs
   if (typeof options.lockDir !== "string" || options.lockDir.length === 0) options.lockDir = DEFAULTS.lockDir
   if (typeof options.logFile !== "string" || options.logFile.length === 0) options.logFile = DEFAULTS.logFile
+  if (!options.routing || typeof options.routing !== "object") options.routing = {}
+  options.routing = { ...DEFAULTS.routing, ...options.routing }
+  if (typeof options.routing.configPath !== "string" || options.routing.configPath.length === 0)
+    options.routing.configPath = DEFAULTS.routing.configPath
+  options.routing.enabled = options.routing.enabled === true
   return options
 }
 
@@ -283,6 +308,44 @@ class Budget {
   }
 }
 
+/**
+ * Reads a body into memory so it can be inspected, and hands back a reader for
+ * the same bytes. Cloning a response would lock the stream it was taken from,
+ * so the bytes are buffered instead.
+ */
+async function bufferBody(body) {
+  const reader = body.getReader()
+  const chunks = []
+  let text = ""
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      // Only the beginning of the body is needed to classify the failure.
+      if (text.length < 2048) text += new TextDecoder().decode(value, { stream: true })
+    }
+  } catch {
+    // A body that cannot be read leaves the classification to the status code.
+  }
+  return { reader: readerFromChunks(chunks), text }
+}
+
+/** Replays buffered chunks as a readable stream. */
+function readerFromChunks(chunks) {
+  const iterator = chunks[Symbol.iterator]()
+  return {
+    async read() {
+      const next = iterator.next()
+      if (next.done) return { done: true, value: undefined }
+      return { done: false, value: next.value }
+    },
+    async cancel(reason) {
+      await iterator.return?.(reason)
+    },
+  }
+}
+
 export default {
   id: "opencode-gate-plugin",
   async setup(ctx) {
@@ -339,6 +402,138 @@ export default {
       const line = `limits: ${summary || "(none)"} lockDir=${options.lockDir}`
       console.error(`[opencode-gate-plugin] ${line}`)
       writeLog(options.logFile, `setup ${line}`)
+    }
+
+    // Providers that answered with an exhausted allowance, and when that
+    // allowance comes back. The allowance belongs to the account behind the
+    // key, so the state has to be shared between the OpenCode instances using
+    // that key: one instance learning that a subscription is exhausted is
+    // worth nothing if the next instance walks straight into it.
+    const exhaustedFile = join(options.lockDir, "exhausted.json")
+
+    const readExhausted = () => {
+      try {
+        const parsed = JSON.parse(readFileSync(exhaustedFile, "utf8"))
+        return parsed && typeof parsed === "object" ? parsed : {}
+      } catch {
+        return {}
+      }
+    }
+
+    const writeExhausted = (state) => {
+      try {
+        mkdirSync(options.lockDir, { recursive: true })
+        writeFileSync(exhaustedFile, JSON.stringify(state))
+      } catch {
+        // The state is an optimisation; losing it costs one wasted request.
+      }
+    }
+
+    /** The providers whose allowance is gone, right now. */
+    const exhaustedProviders = () => {
+      const now = Date.now()
+      const state = readExhausted()
+      const ids = new Set()
+      let changed = false
+      for (const [providerID, until] of Object.entries(state)) {
+        if (!Number.isFinite(until) || until <= now) {
+          changed = true
+          continue
+        }
+        ids.add(providerID)
+      }
+      if (changed) writeExhausted(state)
+      return ids
+    }
+
+    /** Records that a provider's allowance is gone, until it says otherwise. */
+    const markExhausted = (providerID, until) => {
+      const state = readExhausted()
+      if (state[providerID] === until) return
+      state[providerID] = until
+      writeExhausted(state)
+    }
+
+    // The agent chains, read once at setup. The routing decision needs the
+    // chain of the agent that owns the session, and that lives in
+    // oh-my-opencode-slim's configuration.
+    let chains
+    if (options.routing.enabled) {
+      const loaded = Routing.readChains(options.routing.configPath, options.routing.preset)
+      chains = loaded?.chains
+      if (!chains) {
+        const line = `routing enabled but no agent chains were found in ${options.routing.configPath}`
+        console.error(`[opencode-gate-plugin] ${line}`)
+        writeLog(options.logFile, `setup ${line}`)
+      }
+    }
+
+    if (options.routing?.enabled && options.log) {
+      const line = `routing enabled, ${chains?.size ?? 0} agent chains`
+      console.error(`[opencode-gate-plugin] ${line}`)
+      writeLog(options.logFile, `setup ${line}`)
+    }
+
+    /**
+     * The providers that currently have no free slot. A budget that is
+     * saturated is one whose every slot is taken, in this process and in the
+     * others sharing the key.
+     */
+    const saturatedProviderIDs = () => {
+      const ids = new Set()
+      for (const [providerID, entry] of Object.entries(options.providers)) {
+        const budget = budgetFor(providerID)
+        if (!budget) continue
+        if (budget.saturated) ids.add(providerID)
+      }
+      return ids
+    }
+
+    // Decide the model for an upcoming turn, before the session's model is
+    // resolved for it. The chain is walked from the head every time, so a
+    // provider that was skipped because it was busy is picked again as soon
+    // as it is free.
+    if (options.routing?.enabled && chains) {
+      await ctx.session.hook("prompt", async (event) => {
+        try {
+          const session = await ctx.session.get({ sessionID: event.sessionID })
+          // A session that has not run yet carries no agent, and the runner
+          // picks the default one for it. The agent list starts with that
+          // default, so it is the same choice the runner would make.
+          let agent = session?.agent
+          if (!agent) {
+            // The agent list starts with the default agent, which is the one
+            // the runner would pick for a session that carries none.
+            const listed = await ctx.agent.list()
+            agent = listed?.data?.[0]?.name
+          }
+          const chain = agent ? chains.get(agent) : undefined
+          if (!chain) return
+          const current = session?.model
+            ? `${session.model.providerID}/${session.model.id}`
+            : undefined
+          const saturated = saturatedProviderIDs()
+          // A session that is already on a model that is not saturated stays
+          // where it is, unless it was moved off the head by this module and
+          // the head is free again.
+          const exhausted = exhaustedProviders()
+          const head = Routing.selectHeadModel({ chain, current, saturated, exhausted })
+          const away = Routing.selectModel({ chain, current, saturated, exhausted })
+          const target = head ?? away
+          if (!target) return
+          await ctx.session.switchModel({ sessionID: event.sessionID, model: target })
+          if (options.log) {
+            const from = current ?? "(none)"
+            const line = `${event.sessionID}: routing ${from} -> ${target.providerID}/${target.id}`
+            console.error(`[opencode-gate-plugin] ${line}`)
+            writeLog(options.logFile, `route ${line}`)
+          }
+        } catch (error) {
+          if (options.log) {
+            writeLog(options.logFile, `route failed: ${error?.message ?? error} :: ${error?.stack?.split("\n")[1] ?? ""}`)
+          }
+        }
+      })
     }
 
     // Acquire before the request leaves the process.
@@ -402,8 +597,38 @@ export default {
       if (options.log && response.status !== 200) {
         writeLog(options.logFile, `response ${lease.providerID} status=${response.status}`)
       }
-
-      const reader = body.getReader()
+      // A provider whose allowance is exhausted cannot answer at all until its
+      // quota resets, so the router skips it in the meantime. A provider that is
+      // merely saturated is not exhausted: it comes back into rotation as soon
+      // as it has a free slot.
+      //
+      // The body is buffered rather than cloned, because cloning a response
+      // locks the stream it was taken from.
+      let reader
+      // The allowance can be reported with several status codes. Command Code
+      // answers a 400 for an empty balance, AIReiter and OpenCode Go answer a
+      // 429, and a 402 is the plain payment-required answer.
+      if (response.status === 400 || response.status === 402 || response.status === 429) {
+        const buffered = await bufferBody(body)
+        if (buffered.text && Routing.isExhaustedResponse(response.status, buffered.text)) {
+          const resetSeconds = Routing.parseResetSeconds(buffered.text)
+          const until = Date.now() + (resetSeconds ? resetSeconds * 1000 : options.routing.exhaustedTtlMs)
+          if (!exhaustedProviders().has(lease.providerID)) {
+            markExhausted(lease.providerID, until)
+            if (options.log) {
+              const when = resetSeconds
+                ? `resets in ${Math.round(resetSeconds / 3600)}h`
+                : `for ${Math.round(options.routing.exhaustedTtlMs / 60000)}min`
+              const line = `${lease.providerID}: allowance exhausted, skipping it until it ${when}`
+              console.error(`[opencode-gate-plugin] ${line}`)
+              writeLog(options.logFile, `exhausted ${line}`)
+            }
+          }
+        }
+        reader = buffered.reader
+      } else {
+        reader = body.getReader()
+      }
       const stream = new ReadableStream({
         async pull(controller) {
           try {
