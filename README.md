@@ -56,6 +56,32 @@ Or install from a clone:
 }
 ```
 
+### Two providers, one key
+
+`aireiter` and `aireiter-anthropic` below are two provider definitions that
+share one API key. The provider counts them against a single limit, so they
+must name the same group:
+
+```json
+{
+  "providers": {
+    "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
+    "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
+    "opencode-go":        { "concurrency": 4 },
+    "commandcode":        { "concurrency": 4 }
+  }
+}
+```
+
+Give them separate groups and the plugin would let 4 requests through, which the
+provider would reject.
+
+### Order relative to oh-my-opencode-slim
+
+List this plugin **before** `oh-my-opencode-slim` in the `plugins` array so its
+retry decision is the one oh-my-opencode-slim reads. See
+[Compatibility with oh-my-opencode-slim](#compatibility-with-oh-my-opencode-slim).
+
 ## Configuration
 
 ### `providers`
