@@ -17,6 +17,7 @@ import {
   selectHeadModel,
   isExhaustedResponse,
   parseResetSeconds,
+  selectLocalFallback,
 } from "../src/routing.js"
 
 test("a model reference splits into provider, model and variant", () => {
@@ -211,6 +212,44 @@ test("nothing is chosen when the local model is busy too", () => {
     chain,
     current: "aireiter/gpt-6.1-terra",
     saturated: new Set(["llama.cpp"]),
+    exhausted: new Set(["aireiter"]),
+  })
+  assert.equal(chosen, undefined)
+})
+
+test("an agent with no chain falls back to the local model when its provider is empty", () => {
+  const chosen = selectLocalFallback({
+    current: { providerID: "aireiter", id: "gpt-6.1-terra" },
+    fallback: "llama.cpp/qwen3.6-35b-a3b",
+    exhausted: new Set(["aireiter"]),
+  })
+  assert.deepEqual(chosen, { providerID: "llama.cpp", id: "qwen3.6-35b-a3b", variant: undefined })
+})
+
+test("an agent with no chain stays put while its provider is merely busy", () => {
+  // Saturation is not exhaustion: the provider answers again in a moment,
+  // while the local model has one slow slot.
+  const chosen = selectLocalFallback({
+    current: { providerID: "aireiter", id: "gpt-6.1-terra" },
+    fallback: "llama.cpp/qwen3.6-35b-a3b",
+    exhausted: new Set(),
+  })
+  assert.equal(chosen, undefined)
+})
+
+test("an agent with no chain stays put when the local model is unavailable too", () => {
+  const chosen = selectLocalFallback({
+    current: { providerID: "aireiter", id: "gpt-6.1-terra" },
+    fallback: "llama.cpp/qwen3.6-35b-a3b",
+    exhausted: new Set(["aireiter", "llama.cpp"]),
+  })
+  assert.equal(chosen, undefined)
+})
+
+test("an agent with no chain and no local fallback stays put", () => {
+  const chosen = selectLocalFallback({
+    current: { providerID: "aireiter", id: "gpt-6.1-terra" },
+    fallback: undefined,
     exhausted: new Set(["aireiter"]),
   })
   assert.equal(chosen, undefined)

@@ -249,8 +249,13 @@ class SharedSlots {
     }
   }
 
-  /** Returns the index of the acquired slot, or undefined when none is free. */
-  tryAcquire() {
+  /**
+   * Returns the index of the acquired slot, or undefined when none is free.
+   *
+   * `owner` is written into the slot, so an operator can see which session
+   * holds it without reading this process's memory.
+   */
+  tryAcquire(owner) {
     try {
       mkdirSync(this.dir, { recursive: true })
     } catch (error) {
@@ -265,7 +270,10 @@ class SharedSlots {
       try {
         mkdirSync(path)
         try {
-          writeFileSync(join(path, "owner"), String(process.pid))
+          writeFileSync(
+            join(path, "owner"),
+            JSON.stringify({ pid: process.pid, ...(owner ?? {}), since: Date.now() }),
+          )
         } catch {
           // The lock itself is what matters; the owner file is diagnostic only.
         }
@@ -310,12 +318,12 @@ class Budget {
    * provider's own rejection is more informative than a local error, and the
    * timeout is logged so the bypass is never silent.
    */
-  async acquire(timeoutMs, pollIntervalMs) {
+  async acquire(timeoutMs, pollIntervalMs, owner) {
     if (this.limit <= 0) return () => {}
     const deadline = Date.now() + timeoutMs
     while (true) {
       if (this.local < this.limit) {
-        const slot = this.shared ? this.shared.tryAcquire() : this.local
+        const slot = this.shared ? this.shared.tryAcquire(owner) : this.local
         if (slot !== undefined) {
           this.local++
           return this.#lease(slot)
@@ -570,11 +578,29 @@ export default {
             const listed = await ctx.agent.list()
             agent = listed?.data?.[0]?.name
           }
-          const chain = agent ? chains.get(agent) : undefined
-          if (!chain) return
           const current = session?.model
             ? `${session.model.providerID}/${session.model.id}`
             : undefined
+          const chain = agent ? chains.get(agent) : undefined
+          if (!chain) {
+            // A preset names the agents it knows. An agent outside it has no
+            // chain, and the local model is still its last resort once its own
+            // provider's allowance is gone.
+            const target = Routing.selectLocalFallback({
+              current: session?.model,
+              fallback: options.routing.localFallback,
+              exhausted: exhaustedProviders(),
+            })
+            if (!target) return
+            await ctx.session.switchModel({ sessionID: event.sessionID, model: target })
+            if (options.log) {
+              const who = agent ? ` (${agent})` : ""
+              const line = `${event.sessionID}${who}: routing ${current ?? "(none)"} -> ${target.providerID}/${target.id}, no chain names this agent`
+              console.error(`[opencode-gate-plugin] ${line}`)
+              writeLog(options.logFile, `route ${line}`)
+            }
+            return
+          }
           const saturated = saturatedProviderIDs()
           // A session that is already on a model that is not saturated stays
           // where it is, unless it was moved off the head by this module and
@@ -603,32 +629,37 @@ export default {
     await ctx.session.hook("http.request", async (event) => {
       const budget = budgetFor(event.model?.providerID)
       if (!budget) return
+      const providerID = event.model.providerID
+      // The hook carries the session and the agent, which is what makes a wait
+      // attributable: without them the log says a request waited but not whose.
+      const owner = { sessionID: event.sessionID, agent: event.agent, providerID }
+      const who = `${event.sessionID}${event.agent ? ` (${event.agent})` : ""}`
       const started = Date.now()
       if (budget.saturated && options.log) {
-        const line = `${event.model.providerID}: waiting for a free slot (local=${budget.local}/${budget.limit})`
+        const line = `${providerID}: waiting for a free slot (local=${budget.local}/${budget.limit}) for ${who}`
         console.error(`[opencode-gate-plugin] ${line}`)
         writeLog(options.logFile, `wait ${line}`)
       }
       let release
       try {
-        release = await budget.acquire(options.acquireTimeoutMs, options.pollIntervalMs)
+        release = await budget.acquire(options.acquireTimeoutMs, options.pollIntervalMs, owner)
       } catch (error) {
         // The lock directory is unusable. Without it the budget cannot be
         // shared, so the request goes out ungated and the reason is recorded.
-        const line = `${event.model.providerID}: gate unavailable (${error?.code ?? error}), sending ungated`
+        const line = `${providerID}: gate unavailable (${error?.code ?? error}), sending ungated for ${who}`
         console.error(`[opencode-gate-plugin] ${line}`)
         writeLog(options.logFile, `unavailable ${line}`)
         return
       }
       if (!release) {
-        const line = `${event.model.providerID}: timed out waiting for a slot after ${options.acquireTimeoutMs}ms, sending ungated`
+        const line = `${providerID}: timed out waiting for a slot after ${options.acquireTimeoutMs}ms, sending ungated for ${who}`
         console.error(`[opencode-gate-plugin] ${line}`)
         writeLog(options.logFile, `timeout ${line}`)
         return
       }
       const waited = Date.now() - started
       if (waited > 0 && options.log) {
-        writeLog(options.logFile, `acquired ${event.model.providerID} waited=${waited}ms`)
+        writeLog(options.logFile, `acquired ${providerID} waited=${waited}ms for ${who}`)
       }
       // A response that never arrives leaves the lease held. The watchdog
       // releases it, and the response hook cancels the watchdog once the
@@ -637,10 +668,10 @@ export default {
         if (!leases.has(event.request)) return
         leases.delete(event.request)
         release()
-        writeLog(options.logFile, `watchdog ${event.model.providerID} released a request with no response`)
+        writeLog(options.logFile, `watchdog ${providerID} released a request with no response for ${who}`)
       }, options.responseTimeoutMs)
       if (typeof watchdog.unref === "function") watchdog.unref()
-      leases.set(event.request, { release, providerID: event.model.providerID, watchdog })
+      leases.set(event.request, { release, providerID, watchdog, owner })
     })
 
     // The response hook is the first point where the body exists, so the slot
@@ -658,7 +689,10 @@ export default {
         return
       }
       if (options.log && response.status !== 200) {
-        writeLog(options.logFile, `response ${lease.providerID} status=${response.status}`)
+        const who = `${lease.owner?.sessionID ?? event.sessionID}${
+          lease.owner?.agent ? ` (${lease.owner.agent})` : ""
+        }`
+        writeLog(options.logFile, `response ${lease.providerID} status=${response.status} for ${who}`)
       }
       // A provider whose allowance is exhausted cannot answer at all until its
       // quota resets, so the router skips it in the meantime. A provider that is

@@ -164,6 +164,26 @@ export function withLocalFallback(chain, fallback) {
 }
 
 /**
+ * Picks the local fallback for a session whose agent has no chain.
+ *
+ * A preset names the agents it knows, and an agent outside it has nothing but
+ * its own provider. The local model is still its last resort once that
+ * provider's allowance is gone. Saturation alone is not enough to move it: the
+ * provider will answer again in a moment, while the local model has a single
+ * slow slot.
+ *
+ * Returns undefined when the session should stay where it is.
+ */
+export function selectLocalFallback({ current, fallback, exhausted }) {
+  if (!current || !fallback) return undefined
+  const fallbackRef = parseModelReference(fallback)
+  if (!fallbackRef) return undefined
+  if (!exhausted?.has(current.providerID)) return undefined
+  if (exhausted.has(fallbackRef.providerID)) return undefined
+  return { providerID: fallbackRef.providerID, id: fallbackRef.modelID, variant: fallbackRef.variant }
+}
+
+/**
  * Picks the model a session should use.
  *
  * The chain is walked from the head every time, which is what makes the

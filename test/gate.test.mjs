@@ -10,7 +10,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readdirSync, rmSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -263,4 +263,28 @@ test("a provider without a configured limit has no retry hook effect", async () 
   }
   await hooks["retry"](event)
   assert.equal(event.decision.retry, false)
+})
+
+test("the slot names the session that holds it", async () => {
+  const { hooks, lockDir } = await harness({ aireiter: { concurrency: 1 } })
+  const req = request()
+  await hooks["http.request"]({
+    sessionID: "ses_holder",
+    agent: "fixer",
+    model: { providerID: "aireiter" },
+    request: req,
+  })
+  const owner = JSON.parse(readFileSync(join(lockDir, "aireiter", "slot-0", "owner"), "utf8"))
+  assert.equal(owner.sessionID, "ses_holder")
+  assert.equal(owner.agent, "fixer")
+  assert.equal(owner.providerID, "aireiter")
+  assert.equal(owner.pid, process.pid)
+  assert.ok(Number.isFinite(owner.since), "the owner records when it took the slot")
+
+  const body = new ReadableStream({ start(controller) {
+    queueMicrotask(() => controller.close())
+  } })
+  const event = { model: { providerID: "aireiter" }, request: req, response: new Response(body, { status: 200 }) }
+  await hooks["http.response"](event)
+  await event.response.text().catch(() => {})
 })
