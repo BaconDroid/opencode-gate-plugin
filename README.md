@@ -89,14 +89,15 @@ A provider that is not listed is not gated.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `acquireTimeoutMs` | `120000` | Give up waiting for a slot and send ungated. The provider's own rejection is more informative than a local error. |
+| `acquireTimeoutMs` | `120000` | Give up waiting for a slot and send ungated. The provider's own rejection is more informative than a local error, and the bypass is logged. |
 | `pollIntervalMs` | `100` | How often a waiting request re-checks for a free slot. |
-| `maxHoldMs` | `900000` | Longest a single request may hold a slot, so an undrained body cannot wedge the gate. |
+| `responseTimeoutMs` | `300000` | Longest a response may take to arrive. A request whose response never comes releases its slot after this, so a transport error cannot wedge the gate. |
+| `maxHoldMs` | `600000` | Longest a single request may hold a slot, covering the case where the response arrived but its body was never consumed. |
 | `lockDir` | `~/.local/state/opencode/opencode-gate-plugin` | Where the cross-process slot locks live. Must be on a filesystem shared by every instance using the key. |
 | `logFile` | `~/.local/state/opencode/opencode-gate-plugin/gate.log` | Activity log. The OpenCode server's stderr is not captured anywhere durable. |
 | `log` | `true` | Log when the gate blocks a request. |
-| `holdModelOnConcurrencyError` | `true` | Keep the request on the same model when the provider rejects it for concurrency. See below. |
-| `concurrencyRetryDelayMs` | `2000` | How long to wait before retrying a request the provider rejected for concurrency. The provider's `Retry-After` wins when it is larger. |
+| `holdModelOnConcurrencyError` | `true` | Retry a request the provider rejected for concurrency on the same model, instead of letting the fallback chain advance. See below. |
+| `concurrencyRetryDelayMs` | `2000` | How long to wait before retrying a request the provider rejected for concurrency. The provider's `Retry-After` wins when it asks for longer. |
 
 ## How it works
 
@@ -116,21 +117,26 @@ where every outbound provider request passes.
 ## Compatibility with oh-my-opencode-slim
 
 [oh-my-opencode-slim](https://github.com/BaconDroid/oh-my-opencode-slim) has its
-own fallback chain: when a provider fails, it switches to the next model. A
-concurrency rejection is a provider failure by that definition, so the chain
-would advance even though waiting a few seconds would have resolved the
-request.
+own fallback chain: when a provider fails, it switches to the next model.
 
-The plugin therefore also hooks `session.hook("retry")`. When the error is a
-concurrency rejection, it keeps the decision as a retry with a delay long
-enough for the gate to hand out a slot. oh-my-opencode-slim's own retry hook
-reads an existing `retry: true` decision and absorbs it instead of switching
-models, so the request stays on its model.
+For a rate-limit error, OpenCode's own session retry already decides
+`{retry: true, delay}`, and oh-my-opencode-slim's retry hook reads that decision
+and absorbs it rather than switching models, up to `fallback.maxRetries` times
+per session. A concurrency rejection therefore does not normally advance the
+chain.
+
+The plugin still hooks `session.hook("retry")`, for two reasons:
+
+- It **forces** the retry decision when the host had given up. A concurrency
+  rejection is a saturated provider, not a broken one, so retrying the same
+  model is the right move even when the host's own policy had declined.
+- It never shortens a delay the host computed from the provider's
+  `Retry-After`. A provider that says "wait 60 seconds" is obeyed.
 
 Set `holdModelOnConcurrencyError` to `false` to leave the fallback behaviour
 untouched.
 
-Two independent mechanisms therefore cover the same ground:
+Two independent mechanisms cover the same ground:
 
 | | Scope | Controls |
 | --- | --- | --- |
@@ -140,6 +146,14 @@ Two independent mechanisms therefore cover the same ground:
 They compose: the admission limit keeps the queue short, the gate keeps the
 provider's quota intact.
 
+### Ordering
+
+Hook callbacks run in plugin registration order, which follows the order of the
+`plugins` array in the OpenCode config. Listing this plugin **before**
+`oh-my-opencode-slim` means its retry decision is the one oh-my-opencode-slim
+sees, which is the behaviour described above. The plugin works either way; the
+ordering only decides who gets the last word on the delay.
+
 ## Reading the log
 
 ```
@@ -147,7 +161,8 @@ setup limits: aireiter->aireiter-plan(2), aireiter-anthropic->aireiter-plan(2), 
 wait aireiter: waiting for a free slot (local=2/2)
 acquired aireiter waited=14692ms
 response aireiter status=429
-hold aireiter: concurrency rejection, holding model for 3000ms
+hold aireiter: concurrency rejection, retrying the same model in 2000ms
+watchdog aireiter released a request with no response
 ```
 
 `waited=` is how long a request queued before it was allowed to go out. Long

@@ -31,10 +31,9 @@
  *   - Each provider gets its own limit. Providers that share an API key are
  *     declared as members of one group, and the group draws from a single
  *     budget.
- *   - A concurrency rejection that still gets through is left to OpenCode's own
- *     session retry, but the `retry` hook keeps the request on the same model
- *     instead of letting oh-my-opencode-slim burn its fallback chain on a
- *     condition that waiting resolves.
+ *   - A concurrency rejection that still gets through is retried on the same
+ *     model, so a fallback chain is not spent on a condition that waiting
+ *     resolves.
  */
 
 import { mkdirSync, rmSync, readdirSync, statSync, writeFileSync, appendFileSync } from "node:fs"
@@ -55,16 +54,22 @@ const DEFAULTS = {
    * together. A provider without an entry is not gated.
    */
   providers: {},
-  /** Give up waiting for a slot after this many milliseconds and send anyway. */
+  /** Give up waiting for a slot after this many milliseconds. */
   acquireTimeoutMs: 120000,
   /** How often a waiting request re-checks for a free slot. */
   pollIntervalMs: 100,
   /**
-   * Longest a single request may hold a slot. A response body that is never
-   * drained would otherwise keep the slot forever, so the lease is force
-   * released after this long. It must exceed the provider's request timeout.
+   * Longest a response may take to arrive. A request whose response never
+   * arrives keeps its slot until this watchdog fires, so it is kept close to
+   * the provider's own request timeout rather than to the length of a
+   * generation.
    */
-  maxHoldMs: 15 * 60 * 1000,
+  responseTimeoutMs: 300000,
+  /**
+   * Longest a single request may hold a slot. It bounds the case where the
+   * response arrived but its body was never consumed.
+   */
+  maxHoldMs: 10 * 60 * 1000,
   /**
    * Directory holding the cross-process slot locks. It must be on a filesystem
    * shared by every OpenCode instance that uses the same key.
@@ -79,17 +84,15 @@ const DEFAULTS = {
   /** Log when the gate actually blocks a request. */
   log: true,
   /**
-   * Keep the same model when the provider answers with a concurrency
-   * rejection. oh-my-opencode-slim treats such a rejection as a provider
-   * failure and switches to the next model in the chain, which spends the
-   * chain on a condition that waiting resolves. Setting this to false leaves
-   * the fallback behaviour untouched.
+   * Retry a request the provider rejected for concurrency on the same model,
+   * instead of letting the session's fallback chain advance. The chain is meant
+   * for providers that are actually broken; a saturated provider recovers by
+   * waiting.
    */
   holdModelOnConcurrencyError: true,
   /**
    * How long to wait before retrying a request the provider rejected for
-   * concurrency. The provider sends `Retry-After`, which is honoured when it is
-   * larger than this.
+   * concurrency. The provider's `Retry-After` wins when it asks for longer.
    */
   concurrencyRetryDelayMs: 2000,
 }
@@ -101,6 +104,8 @@ function resolveOptions(raw) {
     options.acquireTimeoutMs = DEFAULTS.acquireTimeoutMs
   if (!Number.isFinite(options.pollIntervalMs) || options.pollIntervalMs <= 0)
     options.pollIntervalMs = DEFAULTS.pollIntervalMs
+  if (!Number.isFinite(options.responseTimeoutMs) || options.responseTimeoutMs <= 0)
+    options.responseTimeoutMs = DEFAULTS.responseTimeoutMs
   if (!Number.isFinite(options.maxHoldMs) || options.maxHoldMs <= 0) options.maxHoldMs = DEFAULTS.maxHoldMs
   if (!Number.isFinite(options.concurrencyRetryDelayMs) || options.concurrencyRetryDelayMs < 0)
     options.concurrencyRetryDelayMs = DEFAULTS.concurrencyRetryDelayMs
@@ -122,16 +127,20 @@ function writeLog(path, message) {
 /**
  * Recognises a provider answer that says "too many requests in flight".
  *
- * The wording differs per provider, so the status code, the error type and the
- * message are all consulted. A plain 429 without a recognisable message is
- * treated as a concurrency rejection, because that is the overwhelmingly
- * common cause of a 429 on these endpoints.
+ * OpenCode already separates a throttle from a quota exhaustion before it
+ * builds the session error, and reports the difference as the error type. That
+ * type is the reliable signal, so it is consulted first; the message is only
+ * read to confirm a concurrency rejection.
  */
-function isConcurrencyRejection(status, message, body) {
-  if (status !== 429) return false
-  const text = `${message ?? ""} ${body ?? ""}`
+function isConcurrencyRejection(error) {
+  if (error?.status !== 429) return false
+  // A quota rejection is not a concurrency problem, whatever its wording.
+  if (error?.type === "provider.quota") return false
+  const text = `${error?.message ?? ""} ${error?.response?.body ?? ""}`
   if (!text.trim()) return true
-  return /too many concurrent|concurren(?:t|cy)|at most \d+ in flight|maximum .* in flight|rate[_-]?limit/i.test(text)
+  return /too many concurrent|concurren(?:t|cy)|at most \d+ in flight|maximum .* in flight|reduce concurrency|high concurrency/i.test(
+    text,
+  )
 }
 
 /**
@@ -165,7 +174,13 @@ class SharedSlots {
       const path = join(this.dir, entry)
       try {
         const stat = statSync(path)
-        if (now - stat.mtimeMs > this.staleMs) rmSync(path, { recursive: true, force: true })
+        if (now - stat.mtimeMs <= this.staleMs) continue
+        // The owner may have released and re-taken the slot between the stat
+        // and the removal. Re-read the timestamp and only remove what is
+        // still the same, stale directory.
+        const again = statSync(path)
+        if (again.mtimeMs !== stat.mtimeMs) continue
+        rmSync(path, { recursive: true, force: true })
       } catch {
         // The slot was released while it was being inspected.
       }
@@ -176,8 +191,11 @@ class SharedSlots {
   tryAcquire() {
     try {
       mkdirSync(this.dir, { recursive: true })
-    } catch {
-      return undefined
+    } catch (error) {
+      // An unusable lock directory is not the same as a busy provider, and
+      // silently treating it as one would stall every request.
+      if (error?.code === "EEXIST") return undefined
+      throw error
     }
     this.#reapStale()
     for (let index = 0; index < this.limit; index++) {
@@ -227,7 +245,8 @@ class Budget {
   /**
    * Resolves with a release function, or with `undefined` when the wait timed
    * out. A timeout sends the request ungated rather than failing it: the
-   * provider's own rejection is more informative than a local error.
+   * provider's own rejection is more informative than a local error, and the
+   * timeout is logged so the bypass is never silent.
    */
   async acquire(timeoutMs, pollIntervalMs) {
     if (this.limit <= 0) return () => {}
@@ -293,6 +312,22 @@ export default {
       return budgets.get(group)
     }
 
+    // Members of one group draw from one budget, so they must agree on its
+    // size. A mismatch would silently apply whichever limit was seen first.
+    const groupLimits = new Map()
+    for (const [providerID, entry] of Object.entries(options.providers)) {
+      const limit = Number(entry?.concurrency ?? entry ?? 0)
+      const group = entry?.group ?? providerID
+      const known = groupLimits.get(group)
+      if (known !== undefined && known !== limit) {
+        const line = `group "${group}" mixes concurrency ${known} and ${limit}; using ${known} for every member`
+        console.error(`[opencode-gate-plugin] ${line}`)
+        writeLog(options.logFile, `conflict ${line}`)
+      } else if (known === undefined) {
+        groupLimits.set(group, limit)
+      }
+    }
+
     if (options.log) {
       const summary = Object.entries(options.providers)
         .map(([providerID, entry]) => {
@@ -316,20 +351,38 @@ export default {
         console.error(`[opencode-gate-plugin] ${line}`)
         writeLog(options.logFile, `wait ${line}`)
       }
-      const release = await budget.acquire(options.acquireTimeoutMs, options.pollIntervalMs)
+      let release
+      try {
+        release = await budget.acquire(options.acquireTimeoutMs, options.pollIntervalMs)
+      } catch (error) {
+        // The lock directory is unusable. Without it the budget cannot be
+        // shared, so the request goes out ungated and the reason is recorded.
+        const line = `${event.model.providerID}: gate unavailable (${error?.code ?? error}), sending ungated`
+        console.error(`[opencode-gate-plugin] ${line}`)
+        writeLog(options.logFile, `unavailable ${line}`)
+        return
+      }
       if (!release) {
-        if (options.log) {
-          const line = `${event.model.providerID}: timed out waiting for a slot, sending ungated`
-          console.error(`[opencode-gate-plugin] ${line}`)
-          writeLog(options.logFile, `timeout ${line}`)
-        }
+        const line = `${event.model.providerID}: timed out waiting for a slot after ${options.acquireTimeoutMs}ms, sending ungated`
+        console.error(`[opencode-gate-plugin] ${line}`)
+        writeLog(options.logFile, `timeout ${line}`)
         return
       }
       const waited = Date.now() - started
       if (waited > 0 && options.log) {
         writeLog(options.logFile, `acquired ${event.model.providerID} waited=${waited}ms`)
       }
-      leases.set(event.request, { release, providerID: event.model.providerID })
+      // A response that never arrives leaves the lease held. The watchdog
+      // releases it, and the response hook cancels the watchdog once the
+      // response is in.
+      const watchdog = setTimeout(() => {
+        if (!leases.has(event.request)) return
+        leases.delete(event.request)
+        release()
+        writeLog(options.logFile, `watchdog ${event.model.providerID} released a request with no response`)
+      }, options.responseTimeoutMs)
+      if (typeof watchdog.unref === "function") watchdog.unref()
+      leases.set(event.request, { release, providerID: event.model.providerID, watchdog })
     })
 
     // The response hook is the first point where the body exists, so the slot
@@ -338,6 +391,7 @@ export default {
       const lease = leases.get(event.request)
       if (!lease) return
       leases.delete(event.request)
+      if (lease.watchdog) clearTimeout(lease.watchdog)
 
       const response = event.response
       const body = response.body
@@ -379,21 +433,19 @@ export default {
     })
 
     // Keep a request that the provider rejected for concurrency on the same
-    // model. OpenCode already retries it; without this, oh-my-opencode-slim
-    // reads the rejection as a provider failure and spends its fallback chain
-    // on a condition that waiting resolves.
+    // model. A saturated provider recovers by waiting, so advancing the
+    // fallback chain spends the chain on nothing.
     if (options.holdModelOnConcurrencyError) {
       await ctx.session.hook("retry", async (event) => {
         const providerID = event.model?.providerID
         if (!budgetFor(providerID)) return
-        const status = event.error?.status
-        const message = event.error?.message ?? ""
-        const body = event.error?.response?.body ?? ""
-        if (!isConcurrencyRejection(status, message, body)) return
-        if (event.decision?.retry !== true) return
-        const delay = Math.max(options.concurrencyRetryDelayMs, 0)
+        if (!isConcurrencyRejection(event.error)) return
+        // Never shorten a delay the host already computed from the provider's
+        // `Retry-After`; that delay is what keeps a saturated provider from
+        // being hammered.
+        const delay = Math.max(options.concurrencyRetryDelayMs, event.decision?.delay ?? 0)
         if (options.log) {
-          const line = `${providerID}: concurrency rejection, holding model for ${delay}ms`
+          const line = `${providerID}: concurrency rejection, retrying the same model in ${delay}ms`
           console.error(`[opencode-gate-plugin] ${line}`)
           writeLog(options.logFile, `hold ${line}`)
         }
