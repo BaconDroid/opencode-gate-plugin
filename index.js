@@ -56,6 +56,19 @@ const DEFAULTS = {
    * together. A provider without an entry is not gated.
    */
   providers: {},
+  /**
+   * A file holding the provider limits, in the same shape as `providers`.
+   *
+   * The file exists because OpenCode replaces the whole `plugins` array with
+   * the one from the highest-priority configuration document. A deployment
+   * that overlays the general configuration cannot add a plugin entry, and
+   * cannot change the options of one either, so the provider-specific limits
+   * have to live in a file the plugin reads.
+   *
+   * Entries in the file override the inline ones, because the file is the
+   * deployment-specific one.
+   */
+  providersFile: undefined,
   /** Give up waiting for a slot after this many milliseconds. */
   acquireTimeoutMs: 120000,
   /** How often a waiting request re-checks for a free slot. */
@@ -114,12 +127,36 @@ const DEFAULTS = {
     exhaustedTtlMs: 30 * 60 * 1000,
     configPath: join(homedir(), ".config/opencode/oh-my-opencode-slim.json"),
     preset: undefined,
+    /**
+     * A model to fall back on when every model in the agent's chain is busy
+     * or exhausted. A local model has no quota and no account, so it is the
+     * last resort. It is appended to the chain rather than inserted, because
+     * it is the least preferred of them.
+     *
+     * The provider must also appear in `providers`, otherwise the gate does
+     * not know how many of its requests may be in flight.
+     */
+    localFallback: undefined,
   },
 }
 
 function resolveOptions(raw) {
-  const options = { ...DEFAULTS, ...(raw ?? {}) }
+  let options = { ...DEFAULTS, ...(raw ?? {}) }
   if (!options.providers || typeof options.providers !== "object") options.providers = {}
+  if (typeof options.providersFile === "string" && options.providersFile.length > 0) {
+    try {
+      const parsed = JSON.parse(readFileSync(options.providersFile, "utf8"))
+      // The file holds the same options as the inline map, so a deployment can
+      // override any of them without touching the plugin entry.
+      const fromFile = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}
+      options = { ...options, ...fromFile }
+      // The inline providers stay as the fallback for anything the file leaves out.
+      options.providers = { ...options.providers, ...(fromFile.providers ?? {}) }
+    } catch (error) {
+      // A missing or unreadable file leaves the inline options in place.
+      console.error(`[opencode-gate-plugin] could not read ${options.providersFile}: ${error?.message ?? error}`)
+    }
+  }
   if (!Number.isFinite(options.acquireTimeoutMs) || options.acquireTimeoutMs < 0)
     options.acquireTimeoutMs = DEFAULTS.acquireTimeoutMs
   if (!Number.isFinite(options.pollIntervalMs) || options.pollIntervalMs <= 0)
@@ -461,6 +498,11 @@ export default {
     if (options.routing.enabled) {
       const loaded = Routing.readChains(options.routing.configPath, options.routing.preset)
       chains = loaded?.chains
+      if (chains && options.routing.localFallback) {
+        for (const [agent, chain] of chains) {
+          chains.set(agent, Routing.withLocalFallback(chain, options.routing.localFallback))
+        }
+      }
       if (!chains) {
         const line = `routing enabled but no agent chains were found in ${options.routing.configPath}`
         console.error(`[opencode-gate-plugin] ${line}`)

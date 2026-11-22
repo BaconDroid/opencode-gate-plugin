@@ -139,6 +139,30 @@ export function parseResetSeconds(text) {
   return undefined
 }
 
+
+/**
+ * Appends the local fallback to a chain.
+ *
+ * A local model has no quota and no account, so it is the last resort when
+ * every subscription is busy or exhausted. It is appended rather than
+ * inserted, because the chain is ordered by preference and the local model is
+ * the least preferred of them: it is slower and weaker than the hosted ones.
+ */
+export function withLocalFallback(chain, fallback) {
+  if (!Array.isArray(chain)) return chain
+  if (!fallback) return chain
+  const parsed = parseModelReference(fallback)
+  if (!parsed) return chain
+  const key = `${parsed.providerID}/${parsed.modelID}`
+  if (chain.some((entry) => {
+    const other = parseModelReference(entry)
+    return other && `${other.providerID}/${other.modelID}` === key
+  })) {
+    return chain
+  }
+  return [...chain, key]
+}
+
 /**
  * Picks the model a session should use.
  *

@@ -56,6 +56,29 @@ Or install from a clone:
 }
 ```
 
+### Deployment-specific limits in a file
+
+OpenCode replaces the whole `plugins` array with the one from the
+highest-priority configuration document. A deployment that overlays a general
+configuration therefore cannot add a plugin entry, and cannot change the
+options of one either, without dropping every other plugin.
+
+`providersFile` exists for that case. The plugin entry stays in the base
+configuration and points at a file the deployment owns:
+
+```json
+{
+  "package": "/root/.local/share/opencode/plugin-src/opencode-gate-plugin",
+  "options": {
+    "providersFile": "/root/.config/opencode/provider-gates.json",
+    "providers": { "opencode-go": { "concurrency": 4 } }
+  }
+}
+```
+
+The file holds the same options, and its entries override the inline ones. A
+missing file leaves the inline options in place, so the plugin still loads.
+
 ### Two providers, one key
 
 `aireiter` and `aireiter-anthropic` below are two provider definitions that
@@ -115,6 +138,7 @@ A provider that is not listed is not gated.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
+| `providersFile` | none | A file holding the same options, read at startup. Its entries override the inline ones. |
 | `acquireTimeoutMs` | `120000` | Give up waiting for a slot and send ungated. The provider's own rejection is more informative than a local error, and the bypass is logged. |
 | `pollIntervalMs` | `100` | How often a waiting request re-checks for a free slot. |
 | `responseTimeoutMs` | `300000` | Longest a response may take to arrive. A request whose response never comes releases its slot after this, so a transport error cannot wedge the gate. |
