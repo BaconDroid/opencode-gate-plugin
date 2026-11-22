@@ -11,6 +11,9 @@
     "index.js",
     "README.md"
   ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",
