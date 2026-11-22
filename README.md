@@ -144,10 +144,11 @@ A provider that is not listed is not gated.
 | `responseTimeoutMs` | `300000` | Longest a response may take to arrive. A request whose response never comes releases its slot after this, so a transport error cannot wedge the gate. |
 | `maxHoldMs` | `600000` | Longest a single request may hold a slot, covering the case where the response arrived but its body was never consumed. |
 | `lockDir` | `~/.local/state/opencode/opencode-gate-plugin` | Where the cross-process slot locks live. Must be on a filesystem shared by every instance using the key. |
-| `logFile` | `~/.local/state/opencode/opencode-gate-plugin/gate.log` | Activity log. The OpenCode server's stderr is not captured anywhere durable. |
-| `log` | `true` | Log when the gate blocks a request. |
+| `logFile` | `gate.log` inside `lockDir` | Activity log. The OpenCode server's stderr is not captured anywhere durable. It follows `lockDir`, so a deployment that moves its locks keeps its log, and a test using a throwaway lock directory cannot write into a live one. |
+| `log` | `true` | Record the gate's activity in `logFile`. With it off, nothing is written to the file; configuration problems still reach stderr. |
 | `holdModelOnConcurrencyError` | `true` | Retry a request the provider rejected for concurrency on the same model, instead of letting the fallback chain advance. See below. |
 | `concurrencyRetryDelayMs` | `2000` | How long to wait before retrying a request the provider rejected for concurrency. The provider's `Retry-After` wins when it asks for longer. |
+| `holdReleaseForRetryAfter` | `false` | Keep the slot for the provider's `Retry-After` after the response ends, in case the provider still counts the finished request as in flight. Capped at 60s and always ended by `maxHoldMs`. Off by default: releasing the instant the body ends has been correct for every provider observed, and holding costs throughput. |
 
 ## How it works
 
@@ -310,6 +311,49 @@ The slot directory is the only state a waiter needs, so the gate keeps that file
 diagnostic: an operator can answer "who is holding this slot" by reading it,
 without a running process to ask.
 
+## Asking the gate what it is doing
+
+`scripts/gate-status.mjs` reads the same state and answers in one command:
+
+```console
+$ node scripts/gate-status.mjs
+gate: healthy - 1 slot is held, all younger than the 300s watchdog window
+lock dir: /root/.local/state/opencode/opencode-gate-plugin
+log: /root/.local/state/opencode/opencode-gate-plugin/gate.log
+
+aireiter-plan: 1 of 2 slots held
+  slot-0  12s  session ses_9f21c4 agent orchestrator
+commandcode: 0 of 4 slots held
+llama.cpp: 0 of 1 slots held
+opencode-go: 0 of 4 slots held
+
+allowance exhausted:
+  opencode-go  returns 2026-12-07T23:15:15.838Z (in 1314732s)
+```
+
+The first line is the verdict, and it is what `--doctor` prints on its own. The
+exit status is 0 when healthy and 1 when degraded, so it can gate a check.
+
+The conditions that make it degraded, each named in the verdict:
+
+| Condition | What it means |
+| --- | --- |
+| the lock directory is missing, is not a directory, or is not writable | the gate cannot coordinate at all, so every request goes out ungated |
+| a held slot is older than `responseTimeoutMs` | a leak the watchdog has not reaped |
+| the log's latest `timeout`, `unavailable` or `watchdog` record is recent | a request was not protected by the gate |
+
+The last one is a recency window, 10 minutes by default, because those records
+are also written by runs that are simply cancelled: a stream that is torn down
+never drains its body. `--recent-ms` moves the window.
+
+The script only reads. A missing log, a truncated `exhausted.json`, an
+unreadable owner file and a half-written log line are reported rather than
+treated as errors. The configured limits come from the log's own
+`setup limits:` record, because OpenCode's configuration is not readable from a
+separate process; when the log has no such record they print as `?`.
+
+`--json` emits the same data, and `--lock-dir` and `--log` point it at another
+instance.
 
 ## Sizing
 

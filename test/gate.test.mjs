@@ -288,3 +288,68 @@ test("the slot names the session that holds it", async () => {
   await hooks["http.response"](event)
   await event.response.text().catch(() => {})
 })
+
+/** A stub provider answer: a concurrency rejection that carries a `Retry-After` header. */
+const rejection = (headers) =>
+  new Response(JSON.stringify({ error: { message: "Too many concurrent requests, at most 2 in flight." } }), {
+    status: 429,
+    headers,
+  })
+
+/** Takes a slot, delivers the answer, drains its body, and returns the slot count right after. */
+async function rejectedWith(hooks, slots, headers) {
+  const req = request()
+  await hooks["http.request"]({ model: { providerID: "p" }, request: req })
+  const event = { model: { providerID: "p" }, request: req, response: rejection(headers) }
+  await hooks["http.response"](event)
+  await event.response.text()
+  return slots("p").length
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test("with holdReleaseForRetryAfter off, a Retry-After does not hold the slot", async () => {
+  const { hooks, slots } = await harness({ p: { concurrency: 1 } })
+  assert.equal(await rejectedWith(hooks, slots, { "retry-after": "1" }), 0)
+})
+
+test("with holdReleaseForRetryAfter on, the slot is held for the Retry-After seconds", async () => {
+  const { hooks, slots } = await harness({ p: { concurrency: 1 } }, { holdReleaseForRetryAfter: true })
+  assert.equal(await rejectedWith(hooks, slots, { "retry-after": "1" }), 1)
+  await sleep(500)
+  assert.equal(slots("p").length, 1, "the slot is still held half way through the Retry-After")
+  await sleep(800)
+  assert.equal(slots("p").length, 0, "the slot is free after the Retry-After")
+})
+
+test("with holdReleaseForRetryAfter on, a Retry-After HTTP date holds the slot", async () => {
+  const { hooks, slots } = await harness({ p: { concurrency: 1 } }, { holdReleaseForRetryAfter: true })
+  // An HTTP date keeps whole seconds, so a date 3s ahead parses to a hold of
+  // between 2000 and 2999ms. The checks sit outside that whole band.
+  const date = new Date(Date.now() + 3000).toUTCString()
+  assert.equal(await rejectedWith(hooks, slots, { "retry-after": date }), 1)
+  await sleep(1500)
+  assert.equal(slots("p").length, 1, "the slot is still held until the date")
+  await sleep(2000)
+  assert.equal(slots("p").length, 0, "the slot is free after the date")
+})
+
+test("with holdReleaseForRetryAfter on, an unparseable Retry-After does not hold the slot", async () => {
+  const { hooks, slots } = await harness({ p: { concurrency: 1 } }, { holdReleaseForRetryAfter: true })
+  assert.equal(await rejectedWith(hooks, slots, { "retry-after": "soon" }), 0)
+})
+
+test("with holdReleaseForRetryAfter on, a response without Retry-After does not hold the slot", async () => {
+  const { hooks, slots } = await harness({ p: { concurrency: 1 } }, { holdReleaseForRetryAfter: true })
+  assert.equal(await rejectedWith(hooks, slots, {}), 0)
+})
+
+test("a slot held for Retry-After is still force-released by maxHoldMs", async () => {
+  const { hooks, slots } = await harness(
+    { p: { concurrency: 1 } },
+    { holdReleaseForRetryAfter: true, maxHoldMs: 600 },
+  )
+  assert.equal(await rejectedWith(hooks, slots, { "retry-after": "30" }), 1)
+  await sleep(900)
+  assert.equal(slots("p").length, 0)
+})

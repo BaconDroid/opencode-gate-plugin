@@ -91,12 +91,10 @@ const DEFAULTS = {
    */
   lockDir: join(homedir(), ".local/state/opencode/opencode-gate-plugin"),
   /**
-   * File the plugin writes its activity to. The OpenCode server's stderr is not
-   * captured anywhere durable, so the log file is the only way to see that the
-   * gate engaged.
+   * Record what the gate does, in `gate.log` inside `lockDir`. The OpenCode
+   * server's stderr is not captured anywhere durable, so the log file is the
+   * only way to see that the gate engaged.
    */
-  logFile: join(homedir(), ".local/state/opencode/opencode-gate-plugin/gate.log"),
-  /** Log when the gate actually blocks a request. */
   log: true,
   /**
    * Retry a request the provider rejected for concurrency on the same model,
@@ -110,6 +108,17 @@ const DEFAULTS = {
    * concurrency. The provider's `Retry-After` wins when it asks for longer.
    */
   concurrencyRetryDelayMs: 2000,
+  /**
+   * Keep a slot for the provider's `Retry-After` after its response has ended,
+   * instead of freeing it the moment the body closes. A provider that still
+   * counts the finished request as in flight for a moment would otherwise
+   * reject the next waiter that is admitted into the slot. The hold is capped
+   * at `MAX_RETRY_AFTER_HOLD_MS` and is always ended by `maxHoldMs`.
+   *
+   * Off by default: a slot that is free the instant the body ends is correct
+   * for every provider observed so far, and holding it costs throughput.
+   */
+  holdReleaseForRetryAfter: false,
   /**
    * Route a request to the next model in the agent's chain when the provider
    * of the current model is saturated, instead of waiting for a slot. When the
@@ -166,8 +175,13 @@ function resolveOptions(raw) {
   if (!Number.isFinite(options.maxHoldMs) || options.maxHoldMs <= 0) options.maxHoldMs = DEFAULTS.maxHoldMs
   if (!Number.isFinite(options.concurrencyRetryDelayMs) || options.concurrencyRetryDelayMs < 0)
     options.concurrencyRetryDelayMs = DEFAULTS.concurrencyRetryDelayMs
+  options.holdReleaseForRetryAfter = options.holdReleaseForRetryAfter === true
   if (typeof options.lockDir !== "string" || options.lockDir.length === 0) options.lockDir = DEFAULTS.lockDir
-  if (typeof options.logFile !== "string" || options.logFile.length === 0) options.logFile = DEFAULTS.logFile
+  // The log follows the lock directory, so a deployment that moves its locks
+  // keeps its log, and a test that uses a throwaway lock directory cannot write
+  // into the log of the instance it is running beside.
+  if (typeof options.logFile !== "string" || options.logFile.length === 0)
+    options.logFile = join(options.lockDir, "gate.log")
   if (!options.routing || typeof options.routing !== "object") options.routing = {}
   options.routing = { ...DEFAULTS.routing, ...options.routing }
   if (typeof options.routing.configPath !== "string" || options.routing.configPath.length === 0)
@@ -184,6 +198,33 @@ function writeLog(path, message) {
   } catch {
     // The log is diagnostic only.
   }
+}
+
+/**
+ * Longest a slot is held for a provider's `Retry-After`. The header is
+ * provider-controlled, so an absurd value must not keep a slot out of rotation
+ * for long.
+ */
+const MAX_RETRY_AFTER_HOLD_MS = 60 * 1000
+
+/**
+ * Reads a `Retry-After` header value as milliseconds from now.
+ *
+ * The value is either a count of seconds or an HTTP date. A value that is
+ * neither, or that asks for no wait, yields `undefined`, so the caller frees the
+ * slot as it would without the header.
+ */
+function parseRetryAfterMs(value, now = Date.now()) {
+  if (value === undefined || value === null) return undefined
+  const text = String(value).trim()
+  if (/^\d+$/.test(text)) {
+    const ms = Number(text) * 1000
+    return ms > 0 ? ms : undefined
+  }
+  const date = Date.parse(text)
+  if (!Number.isFinite(date)) return undefined
+  const ms = date - now
+  return ms > 0 ? ms : undefined
 }
 
 /**
@@ -430,7 +471,7 @@ export default {
       if (known !== undefined && known !== limit) {
         const line = `group "${group}" mixes concurrency ${known} and ${limit}; using ${known} for every member`
         console.error(`[opencode-gate-plugin] ${line}`)
-        writeLog(options.logFile, `conflict ${line}`)
+        if (options.log) writeLog(options.logFile, `conflict ${line}`)
       } else if (known === undefined) {
         groupLimits.set(group, limit)
       }
@@ -668,7 +709,9 @@ export default {
         if (!leases.has(event.request)) return
         leases.delete(event.request)
         release()
-        writeLog(options.logFile, `watchdog ${providerID} released a request with no response for ${who}`)
+        if (options.log) {
+          writeLog(options.logFile, `watchdog ${providerID} released a request with no response for ${who}`)
+        }
       }, options.responseTimeoutMs)
       if (typeof watchdog.unref === "function") watchdog.unref()
       leases.set(event.request, { release, providerID, watchdog, owner })
@@ -683,9 +726,35 @@ export default {
       if (lease.watchdog) clearTimeout(lease.watchdog)
 
       const response = event.response
+
+      // With `holdReleaseForRetryAfter` the slot outlives the response by the
+      // provider's `Retry-After`, because the provider may still count the
+      // finished request as in flight. The lease's own `maxHoldMs` timer is not
+      // cancelled, so it still force-releases a slot that is being held, and
+      // `release` ignores the second call.
+      let holdMs
+      if (options.holdReleaseForRetryAfter) {
+        const requested = parseRetryAfterMs(response.headers.get("retry-after"))
+        if (requested !== undefined) holdMs = Math.min(requested, MAX_RETRY_AFTER_HOLD_MS)
+        if (holdMs !== undefined && options.log) {
+          const capped = requested > holdMs ? ` (capped from ${requested}ms)` : ""
+          const line = `${lease.providerID}: holding the slot ${holdMs}ms for Retry-After${capped}`
+          console.error(`[opencode-gate-plugin] ${line}`)
+          writeLog(options.logFile, `retry-after ${line}`)
+        }
+      }
+      let finished = false
+      const finish = () => {
+        if (holdMs === undefined) return lease.release()
+        if (finished) return
+        finished = true
+        const hold = setTimeout(lease.release, holdMs)
+        if (typeof hold.unref === "function") hold.unref()
+      }
+
       const body = response.body
       if (!body) {
-        lease.release()
+        finish()
         return
       }
       if (options.log && response.status !== 200) {
@@ -731,18 +800,18 @@ export default {
           try {
             const { done, value } = await reader.read()
             if (done) {
-              lease.release()
+              finish()
               controller.close()
               return
             }
             controller.enqueue(value)
           } catch (error) {
-            lease.release()
+            finish()
             controller.error(error)
           }
         },
         async cancel(reason) {
-          lease.release()
+          finish()
           await reader.cancel(reason)
         },
       })
