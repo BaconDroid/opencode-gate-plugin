@@ -248,7 +248,10 @@ have to agree on where that file lives.
 - **Falls back to a local model.** `routing.localFallback` names a model that
   is appended to every chain as the last resort. A local model has no quota and
   no account, so it is what is left when every hosted subscription is busy or
-  empty.
+  empty. An agent the preset does not name has no chain, and it gets the local
+  model too: that is the one place the fallback is reached on exhaustion alone,
+  because a single busy provider is worth waiting for and a single local slot is
+  not worth taking early.
 - **Shares what it learned.** The exhausted state is written to a file under
   `lockDir`, so another OpenCode instance on the same key does not walk into a
   subscription that is already known to be empty.
@@ -279,16 +282,34 @@ The full picture, including what was measured, is in
 
 ```
 setup limits: aireiter->aireiter-plan(2), aireiter-anthropic->aireiter-plan(2), opencode-go->opencode-go(4) ...
-wait aireiter: waiting for a free slot (local=2/2)
-acquired aireiter waited=14692ms
-response aireiter status=429
+wait aireiter: waiting for a free slot (local=2/2) for ses_9f21c4 (orchestrator)
+acquired aireiter waited=14692ms for ses_9f21c4 (orchestrator)
+response aireiter status=429 for ses_9f21c4 (orchestrator)
 hold aireiter: concurrency rejection, retrying the same model in 2000ms
-watchdog aireiter released a request with no response
+watchdog aireiter released a request with no response for ses_9f21c4 (orchestrator)
+route ses_9f21c4 (orchestrator): routing aireiter/mimo-v2.6-flash -> aireiter/gpt-6.1-terra
 ```
 
 `waited=` is how long a request queued before it was allowed to go out. Long
 waits mean the budget is saturated, which is the gate doing its job rather than
 the provider rejecting requests.
+
+Each line names the session and its agent, because a slot is held by a session
+rather than by a provider, and the long pole is a fact about an agent: a fixer
+turn that streams for two minutes blocks the same budget an explorer turn uses
+for one.
+
+A held slot also records who holds it, under
+`<lockDir>/<group>/slot-<n>/owner`:
+
+```json
+{ "pid": 4021, "sessionID": "ses_9f21c4", "agent": "orchestrator", "providerID": "aireiter", "since": 1795368008350 }
+```
+
+The slot directory is the only state a waiter needs, so the gate keeps that file
+diagnostic: an operator can answer "who is holding this slot" by reading it,
+without a running process to ask.
+
 
 ## Sizing
 
