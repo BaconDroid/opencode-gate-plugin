@@ -466,28 +466,49 @@ export default {
       }
     }
 
-    /** The providers whose allowance is gone, right now. */
+    /**
+     * The budget group a provider draws from. Providers that share an API key
+     * share one plan, so one allowance covers all of them.
+     */
+    const groupOf = (providerID) => {
+      const entry = options.providers[providerID]
+      return entry?.group ?? providerID
+    }
+
+    /**
+     * The providers whose allowance is gone, right now.
+     *
+     * The exhaustion is recorded against the budget group rather than the
+     * provider that answered, because an empty allowance on AIReiter's
+     * OpenAI-compatible endpoint empties its Anthropic endpoint too: they are
+     * two provider ids on one key and one plan.
+     */
     const exhaustedProviders = () => {
       const now = Date.now()
       const state = readExhausted()
-      const ids = new Set()
+      const groups = new Set()
       let changed = false
-      for (const [providerID, until] of Object.entries(state)) {
+      for (const [group, until] of Object.entries(state)) {
         if (!Number.isFinite(until) || until <= now) {
           changed = true
           continue
         }
-        ids.add(providerID)
+        groups.add(group)
       }
       if (changed) writeExhausted(state)
+      const ids = new Set()
+      for (const providerID of Object.keys(options.providers)) {
+        if (groups.has(groupOf(providerID))) ids.add(providerID)
+      }
       return ids
     }
 
-    /** Records that a provider's allowance is gone, until it says otherwise. */
+    /** Records that a budget group's allowance is gone, until it says otherwise. */
     const markExhausted = (providerID, until) => {
       const state = readExhausted()
-      if (state[providerID] === until) return
-      state[providerID] = until
+      const group = groupOf(providerID)
+      if (state[group] === until) return
+      state[group] = until
       writeExhausted(state)
     }
 

@@ -175,3 +175,43 @@ test("the reset time is read out of an exhaustion message", () => {
   assert.equal(parseResetSeconds("no reset time here"), undefined)
   assert.equal(parseResetSeconds(undefined), undefined)
 })
+
+test("an exhausted budget group takes every provider that draws from it", () => {
+  // The exhaustion is recorded against the group, because the two provider
+  // ids are one key and one plan.
+  const groups = {
+    aireiter: "aireiter-plan",
+    "aireiter-anthropic": "aireiter-plan",
+    "opencode-go": "opencode-go",
+  }
+  const groupOf = (id) => groups[id] ?? id
+  const state = { "aireiter-plan": Date.now() + 60_000 }
+  const groups_exhausted = new Set(Object.keys(state).filter((g) => state[g] > Date.now()))
+  const exhausted = new Set(
+    Object.keys(groups).filter((id) => groups_exhausted.has(groupOf(id))),
+  )
+  assert.deepEqual([...exhausted].sort(), ["aireiter", "aireiter-anthropic"])
+  assert.equal(exhausted.has("opencode-go"), false)
+})
+
+test("the local model is chosen when every hosted provider is unavailable", () => {
+  const chain = ["aireiter/gpt-6.1-terra", "aireiter-anthropic/claude-sonnet-5-5", "llama.cpp/qwen3.6-35b-a3b"]
+  const chosen = selectModel({
+    chain,
+    current: "aireiter-anthropic/claude-sonnet-5-5",
+    saturated: new Set(),
+    exhausted: new Set(["aireiter", "aireiter-anthropic"]),
+  })
+  assert.deepEqual(chosen, { providerID: "llama.cpp", id: "qwen3.6-35b-a3b", variant: undefined })
+})
+
+test("nothing is chosen when the local model is busy too", () => {
+  const chain = ["aireiter/gpt-6.1-terra", "llama.cpp/qwen3.6-35b-a3b"]
+  const chosen = selectModel({
+    chain,
+    current: "aireiter/gpt-6.1-terra",
+    saturated: new Set(["llama.cpp"]),
+    exhausted: new Set(["aireiter"]),
+  })
+  assert.equal(chosen, undefined)
+})

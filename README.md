@@ -216,14 +216,19 @@ frees up, the next request goes back to the head of the chain.
     "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
     "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
     "opencode-go":        { "concurrency": 4 },
-    "commandcode":        { "concurrency": 4 }
+    "commandcode":        { "concurrency": 4 },
+    "llama.cpp":          { "concurrency": 1 }
   },
   "routing": {
     "enabled": true,
-    "configPath": "/root/.config/opencode/oh-my-opencode-slim.json"
+    "configPath": "/root/.config/opencode/oh-my-opencode-slim.json",
+    "localFallback": "llama.cpp/qwen3.6-35b-a3b"
   }
 }
 ```
+
+A provider in `providers` must be there even when it is only a fallback: the
+gate needs its limit to know whether it is busy.
 
 The chains come from oh-my-opencode-slim's configuration, so the two plugins
 have to agree on where that file lives.
@@ -237,6 +242,13 @@ have to agree on where that file lives.
   answers again once it has a slot; an exhausted one cannot answer at all
   until its quota resets, so it is left out of the rotation until then. The
   reset time is read from the provider's own message when it gives one.
+- **Skips the whole budget group.** The exhaustion is recorded against the
+  group, not the provider that answered, because two provider ids on one key
+  and one plan share one allowance.
+- **Falls back to a local model.** `routing.localFallback` names a model that
+  is appended to every chain as the last resort. A local model has no quota and
+  no account, so it is what is left when every hosted subscription is busy or
+  empty.
 - **Shares what it learned.** The exhausted state is written to a file under
   `lockDir`, so another OpenCode instance on the same key does not walk into a
   subscription that is already known to be empty.
