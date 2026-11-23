@@ -34,8 +34,8 @@ Add the plugin to `~/.config/opencode/opencode.json`:
         "providers": {
           "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
           "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
-          "opencode-go":        { "concurrency": 4 },
-          "commandcode":        { "concurrency": 4 },
+          "opencode-go":        { "concurrency": 2 },
+          "commandcode":        { "concurrency": 2 },
           "open-design":        { "concurrency": 10 }
         }
       }
@@ -72,7 +72,7 @@ configuration and points at a file the deployment owns:
   "package": "/root/.local/share/opencode/plugin-src/opencode-gate-plugin",
   "options": {
     "providersFile": "/root/.config/opencode/provider-gates.json",
-    "providers": { "opencode-go": { "concurrency": 4 } }
+    "providers": { "opencode-go": { "concurrency": 2 } }
   }
 }
 ```
@@ -91,8 +91,8 @@ must name the same group:
   "providers": {
     "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
     "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
-    "opencode-go":        { "concurrency": 4 },
-    "commandcode":        { "concurrency": 4 },
+    "opencode-go":        { "concurrency": 2 },
+    "commandcode":        { "concurrency": 2 },
     "open-design":        { "concurrency": 10 }
   }
 }
@@ -119,7 +119,7 @@ generous quota does not hold back one with a tight quota.
   "providers": {
     "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
     "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
-    "opencode-go":        { "concurrency": 4 }
+    "opencode-go":        { "concurrency": 2 }
   }
 }
 ```
@@ -218,8 +218,8 @@ frees up, the next request goes back to the head of the chain.
   "providers": {
     "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
     "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
-    "opencode-go":        { "concurrency": 4 },
-    "commandcode":        { "concurrency": 4 },
+    "opencode-go":        { "concurrency": 2 },
+    "commandcode":        { "concurrency": 2 },
     "open-design":        { "concurrency": 10 },
     "llama.cpp":          { "concurrency": 1 }
   },
