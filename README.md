@@ -35,7 +35,8 @@ Add the plugin to `~/.config/opencode/opencode.json`:
           "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
           "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
           "opencode-go":        { "concurrency": 4 },
-          "commandcode":        { "concurrency": 4 }
+          "commandcode":        { "concurrency": 4 },
+          "open-design":        { "concurrency": 10 }
         }
       }
     }
@@ -91,7 +92,8 @@ must name the same group:
     "aireiter":           { "concurrency": 2, "group": "aireiter-plan" },
     "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
     "opencode-go":        { "concurrency": 4 },
-    "commandcode":        { "concurrency": 4 }
+    "commandcode":        { "concurrency": 4 },
+    "open-design":        { "concurrency": 10 }
   }
 }
 ```
@@ -218,6 +220,7 @@ frees up, the next request goes back to the head of the chain.
     "aireiter-anthropic": { "concurrency": 2, "group": "aireiter-plan" },
     "opencode-go":        { "concurrency": 4 },
     "commandcode":        { "concurrency": 4 },
+    "open-design":        { "concurrency": 10 },
     "llama.cpp":          { "concurrency": 1 }
   },
   "routing": {
