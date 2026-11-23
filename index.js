@@ -231,19 +231,21 @@ function parseRetryAfterMs(value, now = Date.now()) {
  * Recognises a provider answer that says "too many requests in flight".
  *
  * OpenCode already separates a throttle from a quota exhaustion before it
- * builds the session error, and reports the difference as the error type. That
- * type is the reliable signal, so it is consulted first; the message is only
- * read to confirm a concurrency rejection.
+ * builds the session error, and reports the difference as the error type, so a
+ * quota is rejected on its type alone. The status is not enough on its own:
+ * OpenCode Go answers429, but OpenDesign answers **400** with
+ * `tier_limit_exceeded`, so the words decide whenever there are any - and a
+ * status of429 with no body at all is taken as a throttle.
  */
+const CONCURRENCY_SIGNAL =
+  /too many concurrent|concurren(?:t|cy)|at most \d+ in flight|maximum .* in flight|reduce concurrency|high concurrency|tier_limit_exceeded/i
+
 function isConcurrencyRejection(error) {
-  if (error?.status !== 429) return false
   // A quota rejection is not a concurrency problem, whatever its wording.
   if (error?.type === "provider.quota") return false
   const text = `${error?.message ?? ""} ${error?.response?.body ?? ""}`
-  if (!text.trim()) return true
-  return /too many concurrent|concurren(?:t|cy)|at most \d+ in flight|maximum .* in flight|reduce concurrency|high concurrency/i.test(
-    text,
-  )
+  if (!text.trim()) return error?.status === 429
+  return CONCURRENCY_SIGNAL.test(text)
 }
 
 /**

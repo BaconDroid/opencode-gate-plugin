@@ -254,6 +254,38 @@ test("a plain rate limit is not treated as a concurrency rejection", async () =>
   assert.equal(event.decision.delay, 100)
 })
 
+test("a400 concurrency rejection is retried like a429", async () => {
+  // OpenDesign rejects an eleventh request with400, not429:
+  // {"code":"tier_limit_exceeded","message":"membership concurrency limit
+  // exceeded: 11/10"}. The words, not the status, decide.
+  const { hooks } = await harness({ p: { concurrency: 4 } })
+  const event = {
+    model: { providerID: "p" },
+    error: {
+      status: 400,
+      type: "provider.invalid-request",
+      message:
+        '{"code":"tier_limit_exceeded","message":"membership concurrency limit exceeded: 11/10 resets 2026-11-23T23:21:00Z"}',
+    },
+    decision: { retry: false, delay: 0 },
+  }
+  await hooks["retry"](event)
+  assert.equal(event.decision.retry, true)
+  assert.ok(event.decision.delay >= 2000)
+})
+
+test("an ordinary400 is not a concurrency rejection", async () => {
+  const { hooks } = await harness({ p: { concurrency: 4 } })
+  const event = {
+    model: { providerID: "p" },
+    error: { status: 400, type: "provider.invalid-request", message: "invalid_request: 'messages' is required" },
+    decision: { retry: false, delay: 0 },
+  }
+  await hooks["retry"](event)
+  assert.equal(event.decision.retry, false)
+  assert.equal(event.decision.delay, 0)
+})
+
 test("a provider without a configured limit has no retry hook effect", async () => {
   const { hooks } = await harness({ p: { concurrency: 4 } })
   const event = {
