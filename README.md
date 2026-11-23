@@ -239,6 +239,13 @@ have to agree on where that file lives.
 - **Walks the chain from the head, every time.** A provider that was skipped
   because it was busy is picked again as soon as it is free. The routing is
   elastic, not a one-way descent.
+- **Leaves a model it did not choose alone.** A session on a model outside the
+  agent's chain - the local model, or any model picked with `/model` - is not
+  pulled back to the head. The plugin only intervenes when that model's provider
+  has run out of allowance, and it returns the session to that model as soon as
+  the provider can answer again. A busy provider is not enough: its slot frees
+  in a moment, and waiting is what the gate is for. Without this rule the chain
+  head wins every prompt, which makes a hand-picked model unusable.
 - **Skips a provider whose allowance is exhausted.** A saturated provider
   answers again once it has a slot; an exhausted one cannot answer at all
   until its quota resets, so it is left out of the rotation until then. The
@@ -273,6 +280,8 @@ consults is the one the runner will use.
 ### What it does not do
 
 - It does not change the model of a request that is already in flight.
+- It does not override a model the user picked unless that model's provider has
+  run out of allowance; that is the only reason a session is moved off it.
 - It does not reorder the chain, and it does not change which models are in
   it. That is oh-my-opencode-slim's configuration to decide.
 
@@ -289,7 +298,12 @@ response aireiter status=429 for ses_9f21c4 (orchestrator)
 hold aireiter: concurrency rejection, retrying the same model in 2000ms
 watchdog aireiter released a request with no response for ses_9f21c4 (orchestrator)
 route ses_9f21c4 (orchestrator): routing aireiter/mimo-v2.6-flash -> aireiter/gpt-6.1-terra
+route ses_9f21c4: routing aireiter/gpt-6.1-terra -> llama.cpp/qwen3.6-35b-a3b, back to the model it displaced
 ```
+
+A `route` line that ends with `back to the model it displaced` is the plugin
+returning the session to the model the user chose, once that model's provider
+can answer again.
 
 `waited=` is how long a request queued before it was allowed to go out. Long
 waits mean the budget is saturated, which is the gate doing its job rather than

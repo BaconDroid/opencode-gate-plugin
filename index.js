@@ -580,6 +580,19 @@ export default {
       }
     }
 
+    /**
+     * The model this plugin last set on a session, and the model the session
+     * carried when the plugin moved it off the user's own choice.
+     *
+     * Routing only owns a session it moved itself. A model outside the agent's
+     * chain is the user's choice, and snapping such a session back to the head
+     * on every prompt is what makes a manual choice unusable: the session is
+     * left alone until its own provider's allowance is gone, and it is given
+     * back as soon as that provider can answer again.
+     */
+    const routedModels = new Map()
+    const displacedModels = new Map()
+
     if (options.routing?.enabled && options.log) {
       const line = `routing enabled, ${chains?.size ?? 0} agent chains`
       console.error(`[opencode-gate-plugin] ${line}`)
@@ -643,18 +656,52 @@ export default {
             return
           }
           const saturated = saturatedProviderIDs()
-          // A session that is already on a model that is not saturated stays
-          // where it is, unless it was moved off the head by this module and
-          // the head is free again.
           const exhausted = exhaustedProviders()
-          const head = Routing.selectHeadModel({ chain, current, saturated, exhausted })
-          const away = Routing.selectModel({ chain, current, saturated, exhausted })
-          const target = head ?? away
+          // A session the plugin has not set is on the user's own model, and
+          // only an exhausted allowance justifies moving off it.
+          const owned = current !== undefined && routedModels.get(event.sessionID) === current
+          let target
+          let restored = false
+          if (owned) {
+            const displaced = displacedModels.get(event.sessionID)
+            if (displaced) {
+              const providerID = displaced.split("/")[0]
+              if (!exhausted.has(providerID) && !saturated.has(providerID)) {
+                // The user's own model answers again, so the session goes back
+                // to it before the chain is considered at all.
+                const parsed = Routing.parseModelReference(displaced)
+                if (parsed) {
+                  target = { providerID: parsed.providerID, id: parsed.modelID, variant: parsed.variant }
+                  restored = true
+                  routedModels.delete(event.sessionID)
+                  displacedModels.delete(event.sessionID)
+                }
+              }
+            }
+            if (!target) {
+              // A session the plugin owns falls back to the head as soon as it
+              // is free, then walks down the chain while it is not.
+              const head = Routing.selectHeadModel({ chain, current, saturated, exhausted })
+              const away = Routing.selectModel({ chain, current, saturated, exhausted })
+              target = head ?? away
+            }
+          } else if (current !== undefined) {
+            target = Routing.selectModelWhenExhausted({ chain, current, saturated, exhausted })
+            if (target) displacedModels.set(event.sessionID, current)
+          } else {
+            // A session that has not run yet carries no model of its own, so it
+            // starts on the chain like the runner would start it.
+            const head = Routing.selectHeadModel({ chain, current, saturated, exhausted })
+            const away = Routing.selectModel({ chain, current, saturated, exhausted })
+            target = head ?? away
+          }
           if (!target) return
           await ctx.session.switchModel({ sessionID: event.sessionID, model: target })
+          if (!restored) routedModels.set(event.sessionID, `${target.providerID}/${target.id}`)
           if (options.log) {
             const from = current ?? "(none)"
-            const line = `${event.sessionID}: routing ${from} -> ${target.providerID}/${target.id}`
+            const why = restored ? ", back to the model it displaced" : ""
+            const line = `${event.sessionID}: routing ${from} -> ${target.providerID}/${target.id}${why}`
             console.error(`[opencode-gate-plugin] ${line}`)
             writeLog(options.logFile, `route ${line}`)
           }

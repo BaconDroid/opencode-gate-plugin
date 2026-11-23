@@ -221,6 +221,35 @@ export function selectModel({ chain, current, saturated, exhausted }) {
 }
 
 /**
+ * Picks a chain model for a session the plugin did not put on its current
+ * model, and only when that model's allowance is gone.
+ *
+ * A model outside the agent's chain is the user's own choice, so a provider
+ * that is merely saturated must not override it: it answers again as soon as a
+ * slot frees, and the wait belongs to the gate. An exhausted provider cannot
+ * answer at all until its quota resets, which is the one case where the session
+ * has to move.
+ *
+ * Returns undefined when the session should stay where it is.
+ */
+export function selectModelWhenExhausted({ chain, current, saturated, exhausted }) {
+  if (!Array.isArray(chain) || chain.length === 0) return undefined
+  const currentRef = current ? parseModelReference(current) : undefined
+  if (!currentRef) return undefined
+  if (!exhausted?.has(currentRef.providerID)) return undefined
+  const currentKey = `${currentRef.providerID}/${currentRef.modelID}`
+  for (const reference of chain) {
+    const parsed = parseModelReference(reference)
+    if (!parsed) continue
+    if (`${parsed.providerID}/${parsed.modelID}` === currentKey) continue
+    if (exhausted?.has(parsed.providerID)) continue
+    if (saturated?.has(parsed.providerID)) continue
+    return { providerID: parsed.providerID, id: parsed.modelID, variant: parsed.variant }
+  }
+  return undefined
+}
+
+/**
  * Picks the model to return to when the head of the chain is free again.
  *
  * The head is the agent's preferred model, so the session goes back to it as

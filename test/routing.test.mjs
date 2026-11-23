@@ -15,6 +15,7 @@ import {
   readChains,
   selectModel,
   selectHeadModel,
+  selectModelWhenExhausted,
   isExhaustedResponse,
   parseResetSeconds,
   selectLocalFallback,
@@ -155,6 +156,28 @@ test("the head model is not chosen while it is still saturated", () => {
     exhausted: new Set(),
   })
   assert.equal(head, undefined)
+})
+
+test("a saturated user model is not displaced", () => {
+  // Saturation is the gate's business: the provider answers again once a slot
+  // frees, so the session stays on the model the user chose.
+  const chosen = selectModelWhenExhausted({
+    chain: ["opencode-go/hy4", "commandcode/glm-5.3"],
+    current: "llama.cpp/qwen3.6-35b-a3b",
+    saturated: new Set(["llama.cpp"]),
+    exhausted: new Set(),
+  })
+  assert.equal(chosen, undefined)
+})
+
+test("an exhausted user model moves to the first usable chain member", () => {
+  const chosen = selectModelWhenExhausted({
+    chain: ["opencode-go/hy4", "commandcode/glm-5.3"],
+    current: "llama.cpp/qwen3.6-35b-a3b",
+    saturated: new Set(["opencode-go"]),
+    exhausted: new Set(["llama.cpp"]),
+  })
+  assert.deepEqual(chosen, { providerID: "commandcode", id: "glm-5.3", variant: undefined })
 })
 
 test("an exhausted allowance is told apart from a saturated provider", () => {
