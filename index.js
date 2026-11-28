@@ -54,6 +54,12 @@ const DEFAULTS = {
    * provider. `group` names the budget the provider draws from; providers that
    * share an API key must share a group, because the provider counts them
    * together. A provider without an entry is not gated.
+   *
+   * An entry may also override `acquireTimeoutMs` and `responseTimeoutMs` for
+   * that provider. A provider that answers slowly gets a longer response
+   * timeout without loosening the watchdog for everyone, and a provider with a
+   * single slot gets a longer wait than the acquisition timeout that keeps a
+   * busy pool responsive. A provider left as a bare number has no overrides.
    */
   providers: {},
   /**
@@ -94,6 +100,10 @@ const DEFAULTS = {
    * Record what the gate does, in `gate.log` inside `lockDir`. The OpenCode
    * server's stderr is not captured anywhere durable, so the log file is the
    * only way to see that the gate engaged.
+   *
+   * On by default only for the default `lockDir`. Any other directory belongs
+   * to a test or to a second instance, whose records must not land in the live
+   * log; such a deployment logs when it asks to.
    */
   log: true,
   /**
@@ -108,6 +118,18 @@ const DEFAULTS = {
    * concurrency. The provider's `Retry-After` wins when it asks for longer.
    */
   concurrencyRetryDelayMs: 2000,
+  /**
+   * How many concurrency rejections in a row the gate answers with a retry for
+   * one session and budget group before it stops holding.
+   *
+   * oh-my-opencode-slim absorbs the host's retries and only advances the
+   * agent's chain once the retry hook stops answering for the same model, so an
+   * unconditional hold turns a long saturation into no progress at all: the
+   * request waits for a slot, times out, is rejected, and is held on the same
+   * model again. Past the cap the hook leaves the decision to the host, which
+   * is what lets the chain move to a provider that can answer.
+   */
+  maxConcurrencyHolds: 3,
   /**
    * Keep a slot for the provider's `Retry-After` after its response has ended,
    * instead of freeing it the moment the body closes. A provider that still
@@ -151,6 +173,9 @@ const DEFAULTS = {
 
 function resolveOptions(raw) {
   let options = { ...DEFAULTS, ...(raw ?? {}) }
+  // Whether `log` was asked for has to be known before the default is settled:
+  // the merged object cannot tell an explicit `true` from the default one.
+  let logExplicit = Boolean(raw && typeof raw === "object" && raw.log !== undefined)
   if (!options.providers || typeof options.providers !== "object") options.providers = {}
   if (typeof options.providersFile === "string" && options.providersFile.length > 0) {
     try {
@@ -158,6 +183,7 @@ function resolveOptions(raw) {
       // The file holds the same options as the inline map, so a deployment can
       // override any of them without touching the plugin entry.
       const fromFile = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}
+      if (fromFile.log !== undefined) logExplicit = true
       options = { ...options, ...fromFile }
       // The inline providers stay as the fallback for anything the file leaves out.
       options.providers = { ...options.providers, ...(fromFile.providers ?? {}) }
@@ -175,11 +201,15 @@ function resolveOptions(raw) {
   if (!Number.isFinite(options.maxHoldMs) || options.maxHoldMs <= 0) options.maxHoldMs = DEFAULTS.maxHoldMs
   if (!Number.isFinite(options.concurrencyRetryDelayMs) || options.concurrencyRetryDelayMs < 0)
     options.concurrencyRetryDelayMs = DEFAULTS.concurrencyRetryDelayMs
+  if (!Number.isFinite(options.maxConcurrencyHolds) || options.maxConcurrencyHolds < 0)
+    options.maxConcurrencyHolds = DEFAULTS.maxConcurrencyHolds
   options.holdReleaseForRetryAfter = options.holdReleaseForRetryAfter === true
   if (typeof options.lockDir !== "string" || options.lockDir.length === 0) options.lockDir = DEFAULTS.lockDir
   // The log follows the lock directory, so a deployment that moves its locks
-  // keeps its log, and a test that uses a throwaway lock directory cannot write
-  // into the log of the instance it is running beside.
+  // keeps its log. It is on by default only for the deployment's own directory:
+  // a throwaway directory belongs to a test run, whose lines must not land in
+  // the live log, and such a run logs when it asks to.
+  if (!logExplicit) options.log = options.lockDir === DEFAULTS.lockDir
   if (typeof options.logFile !== "string" || options.logFile.length === 0)
     options.logFile = join(options.lockDir, "gate.log")
   if (!options.routing || typeof options.routing !== "object") options.routing = {}
@@ -499,6 +529,27 @@ export default {
     // worth nothing if the next instance walks straight into it.
     const exhaustedFile = join(options.lockDir, "exhausted.json")
 
+    /**
+     * A per-provider override of a global timing option. An entry left as a
+     * bare number has no overrides, and a non-positive or non-finite value is
+     * treated as absent, so an older providers file keeps working unchanged.
+     */
+    const timingFor = (providerID, key) => {
+      const entry = options.providers[providerID]
+      const value = entry && typeof entry === "object" ? entry[key] : undefined
+      if (Number.isFinite(value) && value > 0) return value
+      return options[key]
+    }
+
+    const whoOf = (event) =>
+      `${event.sessionID ?? "(no session)"}${event.agent ? ` (${event.agent})` : ""}`
+
+    // How many concurrency rejections in a row the gate has answered with a
+    // retry, per session and budget group. The key names the group rather than
+    // the provider because the members of a group share one budget and one
+    // saturation, so a rejection seen through one member is the group's.
+    const concurrencyHolds = new Map()
+
     const readExhausted = () => {
       try {
         const parsed = JSON.parse(readFileSync(exhaustedFile, "utf8"))
@@ -541,6 +592,7 @@ export default {
       let changed = false
       for (const [group, until] of Object.entries(state)) {
         if (!Number.isFinite(until) || until <= now) {
+          delete state[group]
           changed = true
           continue
         }
@@ -723,7 +775,10 @@ export default {
       // The hook carries the session and the agent, which is what makes a wait
       // attributable: without them the log says a request waited but not whose.
       const owner = { sessionID: event.sessionID, agent: event.agent, providerID }
-      const who = `${event.sessionID}${event.agent ? ` (${event.agent})` : ""}`
+      const group = groupOf(providerID)
+      const acquireTimeoutMs = timingFor(providerID, "acquireTimeoutMs")
+      const responseTimeoutMs = timingFor(providerID, "responseTimeoutMs")
+      const who = whoOf(event)
       const started = Date.now()
       if (budget.saturated && options.log) {
         const line = `${providerID}: waiting for a free slot (local=${budget.local}/${budget.limit}) for ${who}`
@@ -732,7 +787,7 @@ export default {
       }
       let release
       try {
-        release = await budget.acquire(options.acquireTimeoutMs, options.pollIntervalMs, owner)
+        release = await budget.acquire(acquireTimeoutMs, options.pollIntervalMs, owner)
       } catch (error) {
         // The lock directory is unusable. Without it the budget cannot be
         // shared, so the request goes out ungated and the reason is recorded.
@@ -742,7 +797,7 @@ export default {
         return
       }
       if (!release) {
-        const line = `${providerID}: timed out waiting for a slot after ${options.acquireTimeoutMs}ms, sending ungated for ${who}`
+        const line = `${providerID}: timed out waiting for a slot after ${acquireTimeoutMs}ms, sending ungated for ${who}`
         console.error(`[opencode-gate-plugin] ${line}`)
         writeLog(options.logFile, `timeout ${line}`)
         return
@@ -761,9 +816,9 @@ export default {
         if (options.log) {
           writeLog(options.logFile, `watchdog ${providerID} released a request with no response for ${who}`)
         }
-      }, options.responseTimeoutMs)
+      }, responseTimeoutMs)
       if (typeof watchdog.unref === "function") watchdog.unref()
-      leases.set(event.request, { release, providerID, watchdog, owner })
+      leases.set(event.request, { release, providerID, group, watchdog, owner })
     })
 
     // The response hook is the first point where the body exists, so the slot
@@ -775,6 +830,13 @@ export default {
       if (lease.watchdog) clearTimeout(lease.watchdog)
 
       const response = event.response
+
+      // A response that arrived at all means the group served this session, so
+      // the run of concurrency holds from earlier is over.
+      if (response.status < 400) {
+        const sessionID = lease.owner?.sessionID ?? event.sessionID
+        concurrencyHolds.delete(`${sessionID}:${lease.group ?? groupOf(lease.providerID)}`)
+      }
 
       // With `holdReleaseForRetryAfter` the slot outlives the response by the
       // provider's `Retry-After`, because the provider may still count the
@@ -879,13 +941,46 @@ export default {
       await ctx.session.hook("retry", async (event) => {
         const providerID = event.model?.providerID
         if (!budgetFor(providerID)) return
+        // A wallet with no allowance cannot answer any request, and holding it
+        // spends one more request per cycle. With oh-my-opencode-slim loaded a
+        // `retry: false` makes it switch the session's model in place, which is
+        // the move that gets the turn answered.
+        if (exhaustedProviders().has(providerID)) {
+          if (options.log) {
+            const until = readExhausted()[groupOf(providerID)]
+            const reset = Number.isFinite(until) ? new Date(until).toISOString() : "an unknown time"
+            const line = `${providerID}: not retrying for ${whoOf(event)}, the group's allowance is gone until ${reset}`
+            console.error(`[opencode-gate-plugin] ${line}`)
+            writeLog(options.logFile, `exhausted ${line}`)
+          }
+          event.decision = { retry: false }
+          return
+        }
         if (!isConcurrencyRejection(event.error)) return
+        // oh-my-opencode-slim absorbs the host's retries and only advances the
+        // agent's chain once this hook stops answering for the same model, so an
+        // unconditional hold converts a long saturation into no progress at all:
+        // every cycle waits, times out, is rejected, and is held again. Past the
+        // cap the decision is left to the host, which lets the chain move.
+        const group = groupOf(providerID)
+        const holdKey = `${event.sessionID}:${group}`
+        const held = concurrencyHolds.get(holdKey) ?? { count: 0 }
+        held.count++
+        concurrencyHolds.set(holdKey, held)
+        if (held.count > options.maxConcurrencyHolds) {
+          if (options.log) {
+            const line = `${providerID}: abandoning the hold after ${held.count} concurrency rejections for group "${group}" for ${whoOf(event)}, leaving the chain to advance`
+            console.error(`[opencode-gate-plugin] ${line}`)
+            writeLog(options.logFile, `release ${line}`)
+          }
+          return
+        }
         // Never shorten a delay the host already computed from the provider's
         // `Retry-After`; that delay is what keeps a saturated provider from
         // being hammered.
         const delay = Math.max(options.concurrencyRetryDelayMs, event.decision?.delay ?? 0)
         if (options.log) {
-          const line = `${providerID}: concurrency rejection, retrying the same model in ${delay}ms`
+          const line = `${providerID}: concurrency rejection ${held.count}/${options.maxConcurrencyHolds}, retrying the same model in ${delay}ms for ${whoOf(event)}`
           console.error(`[opencode-gate-plugin] ${line}`)
           writeLog(options.logFile, `hold ${line}`)
         }
@@ -895,6 +990,7 @@ export default {
 
     return () => {
       budgets.clear()
+      concurrencyHolds.clear()
     }
   },
 }

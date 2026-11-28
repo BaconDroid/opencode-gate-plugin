@@ -128,6 +128,11 @@ generous quota does not hold back one with a tight quota.
 | --- | --- |
 | `concurrency` | Requests that may be in flight for this provider. `0` disables gating for it. |
 | `group` | The budget the provider draws from. Optional; defaults to the provider id. |
+| `acquireTimeoutMs` | Overrides the global one for this provider. Useful for a provider with one slot, where a long wait is cheaper than an ungated request. |
+| `responseTimeoutMs` | Overrides the global one for this provider. A provider with a long generation keeps the global watchdog, a slow-answering one gets a shorter leash. |
+
+An entry may also stay a bare number, as `"llama.cpp": 1`, when it needs no
+overrides.
 
 **Providers that share an API key must share a `group`.** `aireiter` and
 `aireiter-anthropic` above use the same key, so they name the same group and
@@ -146,10 +151,11 @@ A provider that is not listed is not gated.
 | `responseTimeoutMs` | `300000` | Longest a response may take to arrive. A request whose response never comes releases its slot after this, so a transport error cannot wedge the gate. |
 | `maxHoldMs` | `600000` | Longest a single request may hold a slot, covering the case where the response arrived but its body was never consumed. |
 | `lockDir` | `~/.local/state/opencode/opencode-gate-plugin` | Where the cross-process slot locks live. Must be on a filesystem shared by every instance using the key. |
-| `logFile` | `gate.log` inside `lockDir` | Activity log. The OpenCode server's stderr is not captured anywhere durable. It follows `lockDir`, so a deployment that moves its locks keeps its log, and a test using a throwaway lock directory cannot write into a live one. |
-| `log` | `true` | Record the gate's activity in `logFile`. With it off, nothing is written to the file; configuration problems still reach stderr. |
+| `logFile` | `gate.log` inside `lockDir` | Activity log. The OpenCode server's stderr is not captured anywhere durable. It follows `lockDir`, so a deployment that moves its locks keeps its log. |
+| `log` | `true` for the default `lockDir`, `false` otherwise | Record the gate's activity in `logFile`. A different `lockDir` belongs to a test or a second instance, and its records must not land in the live log, so such a deployment logs only when it asks to. With the log off, nothing is written to the file; the ungated-request records (`timeout`, `unavailable`) and configuration problems still reach stderr. |
 | `holdModelOnConcurrencyError` | `true` | Retry a request the provider rejected for concurrency on the same model, instead of letting the fallback chain advance. See below. |
 | `concurrencyRetryDelayMs` | `2000` | How long to wait before retrying a request the provider rejected for concurrency. The provider's `Retry-After` wins when it asks for longer. |
+| `maxConcurrencyHolds` | `3` | How many concurrency rejections in a row the gate holds one session on one budget group before it stops answering the retry hook. Past the cap the agent's chain is left to advance, which is the only way a long saturation makes progress. See below. |
 | `holdReleaseForRetryAfter` | `false` | Keep the slot for the provider's `Retry-After` after the response ends, in case the provider still counts the finished request as in flight. Capped at 60s and always ended by `maxHoldMs`. Off by default: releasing the instant the body ends has been correct for every provider observed, and holding costs throughput. |
 
 ## How it works
@@ -178,13 +184,27 @@ and absorbs it rather than switching models, up to `fallback.maxRetries` times
 per session. A concurrency rejection therefore does not normally advance the
 chain.
 
-The plugin still hooks `session.hook("retry")`, for two reasons:
+The plugin still hooks `session.hook("retry")`, for three reasons:
 
 - It **forces** the retry decision when the host had given up. A concurrency
   rejection is a saturated provider, not a broken one, so retrying the same
   model is the right move even when the host's own policy had declined.
 - It never shortens a delay the host computed from the provider's
   `Retry-After`. A provider that says "wait 60 seconds" is obeyed.
+- It **stops** holding after `maxConcurrencyHolds` rejections in a row for one
+  session and one budget group. Holding forever is what turns a long
+  saturation into no progress: the request waits for a slot, times out, is sent
+  ungated, is rejected, and is held on the same model again, cycle after cycle,
+  while oh-my-opencode-slim keeps absorbing the retries it sees. Past the cap
+  the hook leaves the decision alone, and the chain is free to advance to a
+  provider that can answer.
+
+An exhausted group is never held: its allowance is gone until a known reset
+time, so no retry against it can succeed. The hook answers `{retry: false}`
+instead, which lets oh-my-opencode-slim switch the session's model in place (it
+surfaces the error only when every model in the chain is spent). With that
+plugin absent, `retry: false` surfaces the provider's error rather than burning
+one request per cycle.
 
 Set `holdModelOnConcurrencyError` to `false` to leave the fallback behaviour
 untouched.
@@ -283,6 +303,11 @@ consults is the one the runner will use.
 ### What it does not do
 
 - It does not change the model of a request that is already in flight.
+- It cannot **refuse** to send a request. OpenCode's `http.request` hook lets a
+  plugin replace the `Request` but not veto the call, so a request that timed out
+  waiting for a slot still leaves the process, ungated and logged. The gate's
+  leverage over an exhausted or saturated provider is at the next `retry`, not at
+  the send.
 - It does not override a model the user picked unless that model's provider has
   run out of allowance; that is the only reason a session is moved off it.
 - It does not reorder the chain, and it does not change which models are in
@@ -298,7 +323,9 @@ setup limits: aireiter->aireiter-plan(2), aireiter-anthropic->aireiter-plan(2), 
 wait aireiter: waiting for a free slot (local=2/2) for ses_9f21c4 (orchestrator)
 acquired aireiter waited=14692ms for ses_9f21c4 (orchestrator)
 response aireiter status=429 for ses_9f21c4 (orchestrator)
-hold aireiter: concurrency rejection, retrying the same model in 2000ms
+hold aireiter: concurrency rejection 1/3, retrying the same model in 2000ms for ses_9f21c4 (orchestrator)
+release aireiter: abandoning the hold after 4 concurrency rejections for group "aireiter-plan" for ses_9f21c4 (orchestrator), leaving the chain to advance
+exhausted open-design: not retrying for ses_9f21c4 (orchestrator), the group's allowance is gone until 2026-11-29T00:00:00.000Z
 watchdog aireiter released a request with no response for ses_9f21c4 (orchestrator)
 route ses_9f21c4 (orchestrator): routing aireiter/mimo-v2.6-flash -> aireiter/gpt-6.1-terra
 route ses_9f21c4: routing aireiter/gpt-6.1-terra -> llama.cpp/qwen3.6-35b-a3b, back to the model it displaced

@@ -151,6 +151,22 @@ Ordered by value. Each item is an issue with acceptance criteria.
 6. **[#6] Honour `Retry-After` on release.** Currently unobservable: the live
    runs produced zero 429s, so the immediate release is already correct in
    practice. It is worth confirming rather than assuming.
+7. ~~**[#7] Stop holding one model past a saturation it cannot resolve.**~~
+   **Done.** `maxConcurrencyHolds` caps the consecutive holds per session and
+   budget group, so the chain can advance; a group whose allowance is gone is
+   not held at all.
+8. ~~**[#7] Bound the wait per provider.**~~ **Done.** `acquireTimeoutMs` and
+   `responseTimeoutMs` can be set on a provider entry, so a single-slot
+   provider can wait longer than a pool provider, and a provider that answers
+   slowly gets its own watchdog.
+9. ~~**[#7] Keep test runs out of the live log.**~~ **Done.** `log` is on by
+   default only for the default `lockDir`, and `exhausted.json` now drops
+   entries whose reset time has passed when it is read.
+10. **[#7] Transport failures and endpoint rotation.** ECONNRESET, TLS errors
+    and truncated streams are not concurrency problems, and the gate cannot
+    release the lease of the request that failed: the `retry` event carries no
+    request identity, only the session, the agent and the model. Endpoint
+    rotation belongs to the provider configuration, not to the gate.
 
 ## Decisions already taken
 

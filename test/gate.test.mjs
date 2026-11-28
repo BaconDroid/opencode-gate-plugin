@@ -10,8 +10,8 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdtempSync, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir, homedir } from "node:os"
 import { join } from "node:path"
 
 import plugin from "../index.js"
@@ -24,7 +24,6 @@ async function harness(providerOptions = {}, options = {}) {
     options: {
       providers: providerOptions,
       lockDir,
-      log: false,
       maxHoldMs: 60_000,
       responseTimeoutMs: 60_000,
       ...options,
@@ -384,4 +383,106 @@ test("a slot held for Retry-After is still force-released by maxHoldMs", async (
   assert.equal(await rejectedWith(hooks, slots, { "retry-after": "30" }), 1)
   await sleep(900)
   assert.equal(slots("p").length, 0)
+})
+
+test("logging is off by default for a lock directory that is not the deployment's", async () => {
+  const quiet = await harness({ p: { concurrency: 1 } })
+  assert.equal(existsSync(join(quiet.lockDir, "gate.log")), false)
+
+  const asked = await harness({ p: { concurrency: 1 } }, { log: true })
+  assert.match(readFileSync(join(asked.lockDir, "gate.log"), "utf8"), /setup limits: p->p\(1\)/)
+})
+
+test("logging stays on by default for the deployment's own lock directory", async () => {
+  const scratch = mkdtempSync(join(tmpdir(), "opencode-gate-log-"))
+  const logFile = join(scratch, "gate.log")
+  await plugin.setup({
+    options: {
+      providers: { p: { concurrency: 1 } },
+      lockDir: join(homedir(), ".local/state/opencode/opencode-gate-plugin"),
+      logFile,
+    },
+    session: { hook: async () => {} },
+  })
+  assert.match(readFileSync(logFile, "utf8"), /setup limits: p->p\(1\)/)
+})
+
+test("a provider entry's responseTimeoutMs releases its slot before the global timeout", async () => {
+  const { hooks, slots } = await harness(
+    { p: { concurrency: 1, responseTimeoutMs: 40 } },
+    { responseTimeoutMs: 60_000 },
+  )
+  await hooks["http.request"]({ model: { providerID: "p" }, request: request() })
+  assert.equal(slots("p").length, 1)
+  await sleep(150)
+  assert.equal(slots("p").length, 0, "the watchdog fired at the provider's timeout, not the global one")
+})
+
+test("a provider entry's acquireTimeoutMs bounds that provider's wait", async () => {
+  const { hooks } = await harness({ p: { concurrency: 1, acquireTimeoutMs: 60 } })
+  await hooks["http.request"]({ model: { providerID: "p" }, request: request() })
+  const started = Date.now()
+  await hooks["http.request"]({ model: { providerID: "p" }, request: request() })
+  const elapsed = Date.now() - started
+  assert.ok(elapsed >= 50, `the second request gave up after ${elapsed}ms`)
+  assert.ok(elapsed < 2000, `the second request waited ${elapsed}ms instead of the provider's 60ms`)
+})
+
+/** Drives one acquire, a concurrency rejection, and the retry hook the host runs for it. */
+async function concurrencyCycle(hooks, sessionID, decision) {
+  const req = request()
+  await hooks["http.request"]({ model: { providerID: "p" }, request: req, sessionID })
+  const answered = { model: { providerID: "p" }, request: req, sessionID, response: rejection({}) }
+  await hooks["http.response"](answered)
+  await answered.response.text()
+  const retryEvent = {
+    model: { providerID: "p" },
+    sessionID,
+    error: { status: 429, type: "provider.rate-limit", message: "Too many concurrent requests" },
+    decision,
+  }
+  await hooks["retry"](retryEvent)
+  return retryEvent.decision
+}
+
+/** Drives one request for `sessionID` that the provider answers with 200. */
+async function served(hooks, sessionID) {
+  const req = request()
+  await hooks["http.request"]({ model: { providerID: "p" }, request: req, sessionID })
+  const body = new ReadableStream({ start(controller) { controller.close() } })
+  const event = { model: { providerID: "p" }, request: req, sessionID, response: new Response(body, { status: 200 }) }
+  await hooks["http.response"](event)
+  await event.response.text().catch(() => {})
+}
+
+test("the hold is abandoned after maxConcurrencyHolds concurrency rejections for one group", async () => {
+  const { hooks } = await harness({ p: { concurrency: 1 } }, { maxConcurrencyHolds: 3 })
+  const decisions = []
+  for (let cycle = 0; cycle < 4; cycle++) decisions.push(await concurrencyCycle(hooks, "ses_saturated", { retry: true, delay: 0 }))
+  assert.deepEqual(decisions.slice(0, 3).map((d) => d.delay), [2000, 2000, 2000], "the first three wait for the slot")
+  assert.equal(decisions[3].delay, 0, "the fourth leaves the host's decision alone so the chain can advance")
+})
+
+test("a response that succeeded resets the hold count", async () => {
+  const { hooks } = await harness({ p: { concurrency: 1 } }, { maxConcurrencyHolds: 3 })
+  for (let cycle = 0; cycle < 3; cycle++) await concurrencyCycle(hooks, "ses_recovering", { retry: true, delay: 0 })
+  await served(hooks, "ses_recovering")
+  const after = await concurrencyCycle(hooks, "ses_recovering", { retry: true, delay: 0 })
+  assert.equal(after.delay, 2000, "the group served a request, so the next rejection is held again")
+})
+
+test("a retry on an exhausted budget group is not held", async () => {
+  const { hooks, lockDir } = await harness({ p: { concurrency: 1, group: "plan" } })
+  writeFileSync(join(lockDir, "exhausted.json"), JSON.stringify({ plan: Date.now() + 60_000 }))
+  const decision = await concurrencyCycle(hooks, "ses_dead_wallet", { retry: true, delay: 0 })
+  assert.equal(decision.retry, false)
+})
+
+test("an expired allowance is dropped from exhausted.json when the state is read", async () => {
+  const { hooks, lockDir } = await harness({ p: { concurrency: 1, group: "plan" } })
+  writeFileSync(join(lockDir, "exhausted.json"), JSON.stringify({ plan: Date.now() - 1000, other: Date.now() + 60_000 }))
+  await concurrencyCycle(hooks, "ses_pruned", { retry: true, delay: 0 })
+  const state = JSON.parse(readFileSync(join(lockDir, "exhausted.json"), "utf8"))
+  assert.equal("plan" in state, false)
+  assert.ok(state.other > Date.now(), "a live entry is kept")
 })
